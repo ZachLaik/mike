@@ -8,6 +8,7 @@ import { resolveRequestedModel } from "../routerModels";
 import { UserFacingError } from "../userFacingError";
 import { createServerSupabase } from "../supabase";
 import { buildUserMcpTools, type McpToolEvent } from "../mcpConnectors";
+import type { ExternalSourceStore } from "../mcp/sourceDocuments";
 import type { SourceDocument } from "../sourceDocuments";
 import {
   COURTLISTENER_TOOLS,
@@ -144,12 +145,19 @@ export interface ClientToolsAdapter {
 export class AssistantStreamError extends Error {
   fullText: string;
   events: AssistantEvent[];
+  citations?: unknown[];
 
-  constructor(message: string, fullText: string, events: AssistantEvent[]) {
+  constructor(
+    message: string,
+    fullText: string,
+    events: AssistantEvent[],
+    citations?: unknown[],
+  ) {
     super(message);
     this.name = "AssistantStreamError";
     this.fullText = fullText;
     this.events = events;
+    this.citations = citations;
   }
 }
 
@@ -186,10 +194,17 @@ export function sanitizeAssistantSseChunk(chunk: string): string {
 }
 
 export class AssistantStreamAbortError extends AssistantStreamError {
-  constructor(fullText: string, events: AssistantEvent[]) {
-    super("Stream aborted.", fullText, events);
+  constructor(fullText: string, events: AssistantEvent[], citations?: unknown[]) {
+    super("Stream aborted.", fullText, events, citations);
     this.name = "AbortError";
   }
+}
+
+export function getAssistantStreamErrorCitations(
+  error: AssistantStreamError,
+  fallback: (fullText: string) => unknown[],
+): unknown[] {
+  return error.citations ?? fallback(error.fullText);
 }
 
 class AssistantStreamAskInputsPause extends Error {
@@ -314,6 +329,7 @@ export async function runLLMStream(params: {
   // one assistant response. The guard is invalidated when edit_document
   // changes that document so a post-edit verification read can still happen.
   const turnReadState: TurnReadState = new Map();
+  const externalSourceStore: ExternalSourceStore = new Map();
   const courtlistenerTurnState: CourtlistenerTurnState = {
     casesByClusterId: new Map(),
   };
@@ -325,6 +341,92 @@ export async function runLLMStream(params: {
   let citationsOpenSeen = false;
   let streamingCitationsBuffer = "";
   let streamedCitationCount = 0;
+
+  const resolveCitations = async (
+    text: string,
+    acceptPartial: boolean,
+  ): Promise<{
+    citations: unknown[];
+    parsedCitationCount: number;
+    diagnostics: ReturnType<typeof parseCitationsWithDiagnostics>["diagnostics"];
+  }> => {
+    const parsed = parseCitationsWithDiagnostics(text);
+    const citationOpenIndex = text.lastIndexOf(CITATIONS_OPEN_TAG);
+    const partialCitationText =
+      citationOpenIndex >= 0
+        ? text.slice(citationOpenIndex + CITATIONS_OPEN_TAG.length)
+        : "";
+    const parsedCitations =
+      acceptPartial && parsed.citations.length === 0
+        ? parsePartialCitationObjects(partialCitationText)
+        : parsed.citations;
+    let citations: unknown[];
+    if (buildCitations) {
+      // Custom builders (tabular) bypass document-citation verification.
+      citations = buildCitations(text);
+    } else {
+      const rawCitations = parsedCitations.map((citation) =>
+        createCitation(
+          citation,
+          docIndex,
+          courtlistenerTurnState.casesByClusterId,
+          docStore,
+          externalSourceStore,
+        ),
+      );
+      // Server-side quote verification. Fetch each document's extracted source
+      // text at most once per turn (memoized by doc_id), reading only bytes
+      // already in storage with emitEvents:false. Case citations are matched
+      // against the opinion text cached during this turn.
+      const sourceTextByDocId = new Map<string, Promise<string>>();
+      const getSourceText = (docId: string): Promise<string> => {
+        let pending = sourceTextByDocId.get(docId);
+        if (!pending) {
+          const externalSource = externalSourceStore.get(docId);
+          const label = resolveDocLabel(docId, docStore, docIndex);
+          pending = externalSource
+            ? Promise.resolve(externalSource.text)
+            : label
+              ? readDocumentContent(label, docStore, () => {}, docIndex, db, {
+                  emitEvents: false,
+                })
+              : Promise.resolve("");
+          sourceTextByDocId.set(docId, pending);
+        }
+        return pending;
+      };
+      citations = await verifyCitations(
+        rawCitations,
+        getSourceText,
+        async (clusterId) =>
+          getCachedCaseOpinionTexts(courtlistenerTurnState, clusterId),
+      );
+    }
+    return {
+      citations,
+      parsedCitationCount: parsedCitations.length,
+      diagnostics: parsed.diagnostics,
+    };
+  };
+
+  const resolveErrorCitations = async (): Promise<unknown[] | undefined> => {
+    try {
+      const citations = (await resolveCitations(fullText, true)).citations;
+      if (!buildCitations) {
+        try {
+          write(
+            `data: ${JSON.stringify({ type: "citations", status: "final", citations })}\n\n`,
+          );
+        } catch {
+          // The client may already be disconnected on an aborted stream.
+        }
+      }
+      return citations;
+    } catch {
+      console.error("[chat/stream] failed to preserve stream citations");
+      return undefined;
+    }
+  };
 
   const emitCitationStreamSnapshot = (
     status: "started" | "partial",
@@ -348,6 +450,7 @@ export async function runLLMStream(params: {
         docIndex,
         courtlistenerTurnState.casesByClusterId,
         docStore,
+        externalSourceStore,
       ),
     );
     emitCitationStreamSnapshot("partial", citations);
@@ -561,6 +664,7 @@ export async function runLLMStream(params: {
           courtlistenerTurnState,
           apiKeys,
           nonce,
+          externalSourceStore,
         );
         throwIfAborted(signal);
         for (const r of docsRead) {
@@ -673,6 +777,7 @@ export async function runLLMStream(params: {
       throw new AssistantStreamAbortError(
         fullText,
         events.map(sanitizeAssistantEvent),
+        await resolveErrorCitations(),
       );
     } else {
       flushPartialTurn();
@@ -688,58 +793,21 @@ export async function runLLMStream(params: {
         message,
         fullText,
         events.map(sanitizeAssistantEvent),
+        await resolveErrorCitations(),
       );
     }
   }
 
   flushText();
 
-  // Parse and emit citations from <CITATIONS> block
-  const { citations: parsedCitations, diagnostics: citationDiagnostics } =
-    parseCitationsWithDiagnostics(fullText);
-  let citations: unknown[];
-  if (buildCitations) {
-    // Custom builders (tabular) bypass document-citation verification.
-    citations = buildCitations(fullText);
-  } else {
-    const rawCitations = parsedCitations.map((c) =>
-      createCitation(
-        c,
-        docIndex,
-        courtlistenerTurnState.casesByClusterId,
-        docStore,
-      ),
-    );
-    // Server-side quote verification. Fetch each document's extracted source
-    // text at most once per turn (memoized by doc_id), reading only bytes
-    // already in storage with emitEvents:false. Case citations are matched
-    // against the opinion text cached during this turn.
-    const sourceTextByDocId = new Map<string, Promise<string>>();
-    const getSourceText = (docId: string): Promise<string> => {
-      let pending = sourceTextByDocId.get(docId);
-      if (!pending) {
-        const label = resolveDocLabel(docId, docStore, docIndex);
-        pending = label
-          ? readDocumentContent(label, docStore, () => {}, docIndex, db, {
-              emitEvents: false,
-            })
-          : Promise.resolve("");
-        sourceTextByDocId.set(docId, pending);
-      }
-      return pending;
-    };
-    citations = await verifyCitations(
-      rawCitations,
-      getSourceText,
-      async (clusterId) =>
-        getCachedCaseOpinionTexts(courtlistenerTurnState, clusterId),
-    );
-  }
+  // Parse, verify, and emit citations from <CITATIONS> block.
+  const citationResolution = await resolveCitations(fullText, false);
+  const citations = citationResolution.citations;
   devLog("[chat/stream] final citations", {
-    hasCitationsBlock: citationDiagnostics.hasBlock,
-    citationsBlockLength: citationDiagnostics.rawLength,
-    parseError: citationDiagnostics.error,
-    parsedCitationCount: parsedCitations.length,
+    hasCitationsBlock: citationResolution.diagnostics.hasBlock,
+    citationsBlockLength: citationResolution.diagnostics.rawLength,
+    parseError: citationResolution.diagnostics.error,
+    parsedCitationCount: citationResolution.parsedCitationCount,
     emittedCitationCount: citations.length,
     usedCustomCitationBuilder: !!buildCitations,
   });

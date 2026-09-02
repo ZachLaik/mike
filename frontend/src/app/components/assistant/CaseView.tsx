@@ -63,7 +63,7 @@ const CASE_HTML_SANITIZER_CONFIG = {
     ],
     ALLOW_DATA_ATTR: false,
     ALLOW_ARIA_ATTR: true,
-    ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto):|#)/i,
+    ALLOWED_URI_REGEXP: /^(?:https:|#)/i,
     FORBID_ATTR: ["style"],
     FORBID_TAGS: [
         "embed",

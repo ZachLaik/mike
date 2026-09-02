@@ -8,6 +8,7 @@ import {
     CITATIONS_CLOSE_TAG,
 } from "../chat/citations";
 import type { DocIndex, DocStore } from "../chat/types";
+import type { ExternalSourceStore } from "../mcp/sourceDocuments";
 
 function citationsBlock(json: string) {
     return `Answer text.\n${CITATIONS_OPEN_TAG}\n${json}\n${CITATIONS_CLOSE_TAG}`;
@@ -433,6 +434,77 @@ describe("createCitation", () => {
             url: null,
             pdfUrl: null,
             dateFiled: null,
+        });
+    });
+
+    it("builds a document citation from a registered MCP legal source", () => {
+        const [parsed] = parseCitations(
+            citationsBlock(
+                '[{"ref": 3, "doc_id": "source-0", "quote": "La Cour rejette le pourvoi."}]',
+            ),
+        );
+        const externalSources: ExternalSourceStore = new Map([
+            [
+                "source-0",
+                {
+                    text: "Attendu que la Cour rejette le pourvoi.",
+                    document: {
+                        document_id: "legal-data-hunter:case:ccass-2025-001",
+                        title: "Cour de cassation, chambre commerciale",
+                        type: "case",
+                        metadata: [
+                            {
+                                label: "Citation",
+                                value: "Pourvoi n° 24-10.001",
+                            },
+                        ],
+                        actions: [
+                            {
+                                type: "link",
+                                url: "https://www.legifrance.gouv.fr/example",
+                                label: "Official source",
+                            },
+                        ],
+                        quotes: [],
+                        subdocuments: [
+                            {
+                                document_id:
+                                    "legal-data-hunter:case:ccass-2025-001:text",
+                                title: "Decision",
+                                type: "html",
+                                text: "Attendu que la Cour rejette le pourvoi.",
+                            },
+                        ],
+                    },
+                },
+            ],
+        ]);
+
+        expect(
+            createCitation(parsed, docIndex, undefined, undefined, externalSources),
+        ).toMatchObject({
+            type: "citation_data",
+            kind: "document",
+            ref: 3,
+            doc_id: "source-0",
+            document_id: "legal-data-hunter:case:ccass-2025-001",
+            filename: "Cour de cassation, chambre commerciale",
+            page: 1,
+            quote: "La Cour rejette le pourvoi.",
+            document: {
+                document_id: "legal-data-hunter:case:ccass-2025-001",
+                title: "Cour de cassation, chambre commerciale",
+                type: "case",
+                quotes: [
+                    {
+                        quote: "La Cour rejette le pourvoi.",
+                        target: {
+                            subdocument_id:
+                                "legal-data-hunter:case:ccass-2025-001:text",
+                        },
+                    },
+                ],
+            },
         });
     });
 });

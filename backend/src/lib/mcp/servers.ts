@@ -36,6 +36,10 @@ import {
     type OAuthTokenRow,
     type ToolCacheRow,
 } from "./types";
+import {
+    extractExternalLegalSources,
+    type ExternalLegalSource,
+} from "./sourceDocuments";
 
 export { startUserMcpConnectorOAuth, validateRemoteMcpUrl };
 
@@ -514,7 +518,10 @@ async function resolveCallableTool(
     return { connector, tool: row };
 }
 
-function stringifyMcpResult(result: unknown): string {
+function stringifyMcpResult(result: unknown): {
+    content: string;
+    wasTruncated: boolean;
+} {
     const text = JSON.stringify(
         {
             result,
@@ -523,8 +530,13 @@ function stringifyMcpResult(result: unknown): string {
         null,
         2,
     );
-    if (text.length <= MAX_MCP_RESULT_CHARS) return text;
-    return `${text.slice(0, MAX_MCP_RESULT_CHARS)}\n\n[Truncated MCP result to ${MAX_MCP_RESULT_CHARS} characters]`;
+    if (text.length <= MAX_MCP_RESULT_CHARS) {
+        return { content: text, wasTruncated: false };
+    }
+    return {
+        content: `${text.slice(0, MAX_MCP_RESULT_CHARS)}\n\n[Truncated MCP result to ${MAX_MCP_RESULT_CHARS} characters]`,
+        wasTruncated: true,
+    };
 }
 
 export async function executeMcpToolCall(
@@ -535,6 +547,7 @@ export async function executeMcpToolCall(
 ): Promise<{
     content: string;
     event: McpToolEvent;
+    legalSources: ExternalLegalSource[];
 }> {
     const resolved = await resolveCallableTool(userId, openaiToolName, db);
     if (!resolved) {
@@ -543,6 +556,7 @@ export async function executeMcpToolCall(
                 ok: false,
                 error: "MCP tool is not available or is disabled.",
             }),
+            legalSources: [],
             event: {
                 type: "mcp_tool_call",
                 connector_id: "",
@@ -574,7 +588,16 @@ export async function executeMcpToolCall(
                 ),
             db,
         );
-        const content = stringifyMcpResult(result);
+        const serialized = stringifyMcpResult(result);
+        const legalSources = extractExternalLegalSources(
+            result,
+            {
+                connectorId: connector.id,
+                serverUrl: connector.server_url,
+            },
+            serialized.wasTruncated,
+        );
+        const content = serialized.content;
         await insertMcpAuditLog(db, {
             user_id: userId,
             connector_id: connector.id,
@@ -587,6 +610,7 @@ export async function executeMcpToolCall(
         });
         return {
             content,
+            legalSources,
             event: {
                 type: "mcp_tool_call",
                 connector_id: connector.id,
@@ -612,6 +636,7 @@ export async function executeMcpToolCall(
         });
         return {
             content: JSON.stringify({ ok: false, error: message }),
+            legalSources: [],
             event: {
                 type: "mcp_tool_call",
                 connector_id: connector.id,

@@ -103,13 +103,76 @@ vi.mock("../../lib/access", () => ({
 }));
 
 import { app } from "../../app";
-import { spotlight } from "../../lib/chat";
+import {
+    AssistantStreamAbortError,
+    AssistantStreamError,
+    spotlight,
+} from "../../lib/chat";
 import { createServerSupabase } from "../../lib/supabase";
 
 const VALID_BODY = {
     messages: [{ role: "user", content: "hello" }],
     model: "gemini-3-flash-preview",
 };
+
+const EXTERNAL_CITATION = {
+    type: "citation_data",
+    kind: "document",
+    ref: 1,
+    doc_id: "source-0",
+    document_id: "legal-data-hunter:case:ccass-2025-001",
+    filename: "Cour de cassation, chambre commerciale",
+    verified: true,
+    quote: "la Cour rejette le pourvoi.",
+    quotes: [
+        {
+            page: 1,
+            quote: "la Cour rejette le pourvoi.",
+            verification: { verified: true },
+        },
+    ],
+    document: {
+        document_id: "legal-data-hunter:case:ccass-2025-001",
+        title: "Cour de cassation, chambre commerciale",
+        type: "case",
+        metadata: [{ label: "Citation", value: "Pourvoi n° 24-10.001" }],
+        quotes: [
+            {
+                quote: "la Cour rejette le pourvoi.",
+                target: {
+                    subdocument_id:
+                        "legal-data-hunter:case:ccass-2025-001:text",
+                },
+                verification: { verified: true },
+            },
+        ],
+        subdocuments: [
+            {
+                document_id: "legal-data-hunter:case:ccass-2025-001:text",
+                title: "Cour de cassation, chambre commerciale",
+                type: "html",
+                text: "Attendu que la Cour rejette le pourvoi.",
+            },
+        ],
+    },
+};
+
+function persistedAssistantInsert() {
+    const db = vi.mocked(createServerSupabase).mock.results.at(-1)?.value as {
+        from: ReturnType<typeof vi.fn>;
+    };
+    for (const [index, call] of db.from.mock.calls.entries()) {
+        if (call[0] !== "chat_messages") continue;
+        const query = db.from.mock.results[index]?.value as {
+            insert: ReturnType<typeof vi.fn>;
+        };
+        const payload = query.insert.mock.calls
+            .map(([value]) => value as Record<string, unknown>)
+            .find((value) => value.role === "assistant");
+        if (payload) return payload;
+    }
+    return undefined;
+}
 
 describe("POST /projects/:projectId/chat", () => {
     beforeEach(() => {
@@ -373,4 +436,48 @@ describe("POST /projects/:projectId/chat", () => {
         expect(res.text).toContain('"type":"error"');
         expect(res.text).toContain("[DONE]");
     });
+
+    it.each([
+        [
+            "cancellation",
+            () =>
+                new AssistantStreamAbortError(
+                    'Answer [1]\n<CITATIONS>[{"ref":1,"doc_id":"source-0","quote":"La Cour rejette le pourvoi."}]</CITATIONS>',
+                    [],
+                    [EXTERNAL_CITATION],
+                ),
+        ],
+        [
+            "failure",
+            () =>
+                new AssistantStreamError(
+                    "The response could not be completed. Please try again.",
+                    'Answer [1]\n<CITATIONS>[{"ref":1,"doc_id":"source-0","quote":"La Cour rejette le pourvoi."}]</CITATIONS>',
+                    [
+                        {
+                            type: "error",
+                            message:
+                                "The response could not be completed. Please try again.",
+                        },
+                    ],
+                    [EXTERNAL_CITATION],
+                ),
+        ],
+    ])(
+        "persists the stream-enriched external citation on %s",
+        async (_path, makeError) => {
+            runLLMStream.mockRejectedValue(makeError());
+
+            const res = await request(app)
+                .post("/projects/p1/chat")
+                .set("Authorization", "Bearer test")
+                .send(VALID_BODY);
+
+            expect(res.status).toBe(200);
+            const persisted = persistedAssistantInsert();
+            expect(JSON.parse(JSON.stringify(persisted?.citations))).toEqual([
+                EXTERNAL_CITATION,
+            ]);
+        },
+    );
 });

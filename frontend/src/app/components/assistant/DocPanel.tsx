@@ -92,7 +92,9 @@ export function DocPanel({
 
     const documentId = resolvedDocument.document_id;
     const versionId = resolvedDocument.version_id ?? null;
-    const isCase = resolvedDocument.type === "case";
+    const isLegalSource =
+        resolvedDocument.type === "case" ||
+        resolvedDocument.type === "legislation";
     const viewType = resolveDocumentViewType({
         filename: resolvedDocument.title,
         fileType: resolvedDocument.type,
@@ -121,7 +123,7 @@ export function DocPanel({
         : undefined;
 
     const { activeViewerQuotes, activeHighlightCells } = useMemo(() => {
-        if (mode.kind !== "citation" || isCase) {
+        if (mode.kind !== "citation" || isLegalSource) {
             return {
                 activeViewerQuotes: undefined,
                 activeHighlightCells: undefined,
@@ -150,7 +152,7 @@ export function DocPanel({
                       ]
                     : [],
         };
-    }, [activeDocumentQuote, isCase, mode.kind]);
+    }, [activeDocumentQuote, isLegalSource, mode.kind]);
 
     useEffect(() => {
         setActiveCitationQuoteId(citationQuoteId);
@@ -202,7 +204,7 @@ export function DocPanel({
                 />
             )}
 
-            {mode.kind === "edit" && !isCase && (
+            {mode.kind === "edit" && !isLegalSource && (
                 <div className="px-2 pb-2">
                     <EditCard
                         annotation={mode.edit}
@@ -219,7 +221,7 @@ export function DocPanel({
             )}
 
             <div className="flex flex-1 min-h-0 flex-col">
-                {isCase ? (
+                {isLegalSource ? (
                     <CaseView
                         document={resolvedDocument}
                         activeQuote={activeDocumentQuote}
@@ -270,6 +272,15 @@ type ExternalSourceLink = {
     label: string;
     title: string;
 };
+
+function safeHttpsHref(value: string): string | null {
+    try {
+        const url = new URL(value);
+        return url.protocol === "https:" ? url.href : null;
+    } catch {
+        return null;
+    }
+}
 
 export function DocumentTitleRow({
     document,
@@ -336,25 +347,27 @@ export function DocumentTitleRow({
                             compact={compactActions}
                         />
                     )}
-                    {(document.actions ?? []).map((action, index) =>
-                        action.type === "download" ? (
+                    {(document.actions ?? []).map((action, index) => {
+                        const href = safeHttpsHref(action.url);
+                        if (!href) return null;
+                        return action.type === "download" ? (
                             <UrlDownloadButton
-                                key={`${action.type}:${action.url}:${index}`}
-                                href={action.url}
+                                key={`${action.type}:${href}:${index}`}
+                                href={href}
                                 compact={compactActions}
                             />
                         ) : (
                             <ExternalSourceLinkButton
-                                key={`${action.type}:${action.url}:${index}`}
+                                key={`${action.type}:${href}:${index}`}
                                 link={{
-                                    href: action.url,
+                                    href,
                                     label: action.label,
                                     title: action.title ?? action.label,
                                 }}
                                 compact={compactActions}
                             />
-                        ),
-                    )}
+                        );
+                    })}
                 </div>
             </div>
             {document.metadata.length > 0 && (

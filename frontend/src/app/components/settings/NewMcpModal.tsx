@@ -2,6 +2,7 @@
 
 import { Check, ChevronDown, Eye, EyeOff, Loader2 } from "lucide-react";
 import { FieldLabel } from "@/app/components/ui/form-field";
+import { PillButton } from "@/app/components/ui/pill-button";
 import {
     SETTINGS_CONTROL_CLASS,
     SettingsTextInput,
@@ -18,6 +19,11 @@ export type NewMcpDraft = {
     bearerToken: string;
     customHeaders: string;
 };
+
+export const LEGAL_DATA_HUNTER_MCP_PRESET = {
+    name: "Legal Data Hunter",
+    serverUrl: "https://legaldatahunter.com/mcp",
+} as const;
 
 export type NewMcpStep = "form" | "working" | "auth" | "success";
 
@@ -121,10 +127,28 @@ export function NewMcpModal({
                 />
             ) : (
                 <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pb-4">
-                    <p className="text-sm text-gray-500">
-                        The assistant will have access to this MCP server and
-                        its enabled tools.
-                    </p>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                        <p className="text-sm text-gray-500">
+                            The assistant will have access to this MCP server and
+                            its enabled tools.
+                        </p>
+                        <PillButton
+                            type="button"
+                            tone="white"
+                            size="sm"
+                            disabled={step === "working"}
+                            onClick={() =>
+                                onDraftChange({
+                                    ...draft,
+                                    ...LEGAL_DATA_HUNTER_MCP_PRESET,
+                                    bearerToken: "",
+                                    customHeaders: "",
+                                })
+                            }
+                        >
+                            Use Legal Data Hunter
+                        </PillButton>
+                    </div>
                     <NewMcpForm
                         draft={draft}
                         showToken={showToken}

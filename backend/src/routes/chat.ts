@@ -16,6 +16,7 @@ import {
     buildCancelledAssistantMessage,
     extractCitations,
     generateSpotlightNonce,
+    getAssistantStreamErrorCitations,
     isAbortError,
     runLLMStream,
     stripTransientAssistantEvents,
@@ -893,8 +894,10 @@ chatRouter.post("/", requireAuth, async (req, res) => {
                 const partial = buildCancelledAssistantMessage({
                     fullText: err.fullText,
                     events: err.events,
-                    buildCitations: (fullText) =>
-                        extractCitations(fullText, docIndex),
+                    buildCitations: () =>
+                        getAssistantStreamErrorCitations(err, (text) =>
+                            extractCitations(text, docIndex),
+                        ),
                 });
                 const saveError = askInputsResponse
                     ? null
@@ -928,7 +931,12 @@ chatRouter.post("/", requireAuth, async (req, res) => {
         const errorFullText =
             err instanceof AssistantStreamError ? err.fullText : "";
         try {
-            const citations = extractCitations(errorFullText, docIndex);
+            const citations =
+                err instanceof AssistantStreamError
+                    ? getAssistantStreamErrorCitations(err, (fullText) =>
+                          extractCitations(fullText, docIndex),
+                      )
+                    : extractCitations(errorFullText, docIndex);
             const saveError = askInputsResponse
                 ? null
                 : await updateReservedAssistantMessage(

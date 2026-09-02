@@ -15,6 +15,7 @@ import {
   enrichWithPriorEvents,
   extractCitations,
   generateSpotlightNonce,
+  getAssistantStreamErrorCitations,
   isAbortError,
   parseChatMessages,
   parseOptionalChatId,
@@ -1218,8 +1219,10 @@ wordChatRouter.post("/", requireAuth, async (req, res) => {
         const partial = buildCancelledAssistantMessage({
           fullText: error.fullText,
           events: error.events,
-          buildCitations: (fullText) =>
-            extractCitations(fullText, docIndex, docStore),
+          buildCitations: () =>
+            getAssistantStreamErrorCitations(error, (fullText) =>
+              extractCitations(fullText, docIndex, docStore),
+            ),
         });
         const partialEvents = await normalizeAssistantEvents(partial.events);
         const saveError = await updateAssistantMessage(
@@ -1242,7 +1245,12 @@ wordChatRouter.post("/", requireAuth, async (req, res) => {
     const errorFullText =
       error instanceof AssistantStreamError ? error.fullText : "";
     try {
-      const citations = extractCitations(errorFullText, docIndex, docStore);
+      const citations =
+        error instanceof AssistantStreamError
+          ? getAssistantStreamErrorCitations(error, (fullText) =>
+              extractCitations(fullText, docIndex, docStore),
+            )
+          : extractCitations(errorFullText, docIndex, docStore);
       const normalizedErrorEvents = await normalizeAssistantEvents(errorEvents);
       const saveError = await updateAssistantMessage(
         normalizedErrorEvents.length ? normalizedErrorEvents : null,

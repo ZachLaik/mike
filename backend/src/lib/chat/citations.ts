@@ -1,4 +1,5 @@
 import { type DocIndex, type DocStore, resolveDoc } from "./types";
+import type { ExternalSourceStore } from "../mcp/sourceDocuments";
 import {
   normalizeCaseDocument,
   sourceDocumentType,
@@ -280,6 +281,7 @@ export function createCitation(
   docIndex: DocIndex,
   casesByClusterId?: CasesByClusterId,
   docStore?: DocStore,
+  externalSourceStore?: ExternalSourceStore,
 ) {
   if (citation.kind === "case") {
     const caseRecord = casesByClusterId?.get(citation.cluster_id);
@@ -303,6 +305,34 @@ export function createCitation(
       url: caseRecord?.url ?? null,
       pdfUrl: caseRecord?.pdfUrl ?? null,
       dateFiled: caseRecord?.dateFiled ?? null,
+      quotes: citation.quotes,
+    };
+  }
+
+  const externalSource = externalSourceStore?.get(citation.doc_id);
+  if (externalSource) {
+    const subdocumentId = externalSource.document.subdocuments?.[0]?.document_id;
+    const quotes: SourceDocumentQuote[] = citation.quotes.map((quote) => ({
+      quote: quote.quote,
+      target: subdocumentId ? { subdocument_id: subdocumentId } : {},
+    }));
+    return {
+      type: "citation_data",
+      kind: "document",
+      ref: citation.ref,
+      document: {
+        ...externalSource.document,
+        quotes,
+      },
+      doc_id: citation.doc_id,
+      document_id: externalSource.document.document_id,
+      version_id: null,
+      version_number: null,
+      filename: externalSource.document.title,
+      page: citation.page,
+      quote: citation.quote,
+      sheet: citation.sheet,
+      cell: citation.cell,
       quotes: citation.quotes,
     };
   }
