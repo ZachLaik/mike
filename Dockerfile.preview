@@ -1,0 +1,41 @@
+FROM node:22-slim AS backend-build
+WORKDIR /build/backend
+COPY backend/package*.json ./
+RUN npm ci
+COPY backend/ ./
+RUN npm run build
+
+FROM node:22-slim AS frontend-build
+WORKDIR /build/frontend
+COPY frontend/package*.json ./
+RUN npm ci
+COPY frontend/ ./
+COPY backend/src /build/backend/src
+COPY word-addin/src /build/word-addin/src
+RUN npm run build
+
+FROM node:22-slim
+WORKDIR /app
+COPY --from=backend-build /build/backend /app/backend
+COPY --from=frontend-build /build/frontend /app/frontend
+RUN printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'cd /app/backend' \
+  'node dist/index.js &' \
+  'backend_pid=$!' \
+  'cd /app/frontend' \
+  'PORT=3000 npm start &' \
+  'frontend_pid=$!' \
+  'cleanup() {' \
+  '  kill -TERM "$backend_pid" "$frontend_pid" 2>/dev/null || true' \
+  '  wait "$backend_pid" "$frontend_pid" 2>/dev/null || true' \
+  '}' \
+  'trap cleanup TERM INT EXIT' \
+  'wait -n "$backend_pid" "$frontend_pid"' \
+  > /usr/local/bin/start-mike \
+  && chmod +x /usr/local/bin/start-mike
+
+ENV NODE_ENV=production
+EXPOSE 3000 3001
+CMD ["/usr/local/bin/start-mike"]

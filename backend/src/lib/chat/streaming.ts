@@ -32,6 +32,7 @@ import {
   parseCitationsWithDiagnostics,
   parsePartialCitationObjects,
   createCitation,
+  boundExternalCitationPayloads,
   CITATIONS_OPEN_TAG,
 } from "./citations";
 import { runToolCalls } from "./tools/toolDispatcher";
@@ -365,14 +366,24 @@ export async function runLLMStream(params: {
       // Custom builders (tabular) bypass document-citation verification.
       citations = buildCitations(text);
     } else {
-      const rawCitations = parsedCitations.map((citation) =>
-        createCitation(
-          citation,
-          docIndex,
-          courtlistenerTurnState.casesByClusterId,
-          docStore,
-          externalSourceStore,
-        ),
+      const rawCitations = boundExternalCitationPayloads(
+        parsedCitations
+          .map((citation) =>
+            createCitation(
+              citation,
+              docIndex,
+              courtlistenerTurnState.casesByClusterId,
+              docStore,
+              externalSourceStore,
+            ),
+          )
+          .filter(
+            (
+              citation,
+            ): citation is NonNullable<ReturnType<typeof createCitation>> =>
+              citation !== null,
+          ),
+        externalSourceStore,
       );
       // Server-side quote verification. Fetch each document's extracted source
       // text at most once per turn (memoized by doc_id), reading only bytes

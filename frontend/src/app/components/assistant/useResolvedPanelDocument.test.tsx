@@ -50,6 +50,37 @@ describe("useResolvedPanelDocument", () => {
         expect(result.current.document.subdocuments).toHaveLength(1);
     });
 
+    it("hydrates missing legislation content through the same panel path", async () => {
+        const legislation = {
+            ...summary,
+            document_id: "ldh:opaque-document-handle",
+            title: "Code civil, article 1103",
+            type: "legislation" as const,
+        };
+        getPanelDocumentMock.mockResolvedValue({
+            ...legislation,
+            quotes: [],
+            subdocuments: [
+                {
+                    document_id: "ldh:opaque-document-handle:text",
+                    title: legislation.title,
+                    type: "html",
+                    text: "Les contrats légalement formés tiennent lieu de loi.",
+                },
+            ],
+        });
+
+        const { result } = renderHook(() =>
+            useResolvedPanelDocument(legislation),
+        );
+
+        await waitFor(() => expect(result.current.isLoading).toBe(false));
+        expect(getPanelDocumentMock).toHaveBeenCalledWith(
+            "ldh:opaque-document-handle",
+        );
+        expect(result.current.document.subdocuments).toHaveLength(1);
+    });
+
     it("retries a failed hydration request", async () => {
         getPanelDocumentMock
             .mockRejectedValueOnce(new Error("temporary failure"))

@@ -1,0 +1,10 @@
+.git
+**/node_modules
+frontend/.next
+frontend/.open-next
+backend/dist
+word-addin/dist
+coverage
+playwright-report
+test-results
+.DS_Store

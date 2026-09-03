@@ -1,0 +1,32 @@
+app = "mike-legaldatahunter-preview"
+primary_region = "cdg"
+
+[build]
+  dockerfile = "Dockerfile.preview"
+
+[env]
+  API_BASE_URL = "http://127.0.0.1:3001"
+  API_PUBLIC_URL = "https://mike-legaldatahunter-preview.fly.dev/api"
+  FRONTEND_URL = "https://mike-legaldatahunter-preview.fly.dev"
+  NODE_ENV = "production"
+  PORT = "3001"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "10s"
+    grace_period = "30s"
+    method = "GET"
+    path = "/api/health"
+    protocol = "http"
+
+[[vm]]
+  memory = "1gb"
+  cpu_kind = "shared"
+  cpus = 1

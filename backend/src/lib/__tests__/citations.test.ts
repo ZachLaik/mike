@@ -4,6 +4,9 @@ import {
     parseCitationsWithDiagnostics,
     parsePartialCitationObjects,
     createCitation,
+    boundExternalCitationPayloads,
+    MAX_EXTERNAL_CITATIONS_PER_RESPONSE,
+    MAX_EXTERNAL_CITATION_PAYLOAD_CHARS,
     CITATIONS_OPEN_TAG,
     CITATIONS_CLOSE_TAG,
 } from "../chat/citations";
@@ -506,5 +509,79 @@ describe("createCitation", () => {
                 ],
             },
         });
+    });
+
+    it("rejects an unregistered source handle instead of fabricating a document", () => {
+        const [parsed] = parseCitations(
+            citationsBlock(
+                '[{"ref": 4, "doc_id": "source-99", "quote": "Untrusted"}]',
+            ),
+        );
+
+        expect(
+            createCitation(parsed, docIndex, undefined, undefined, new Map()),
+        ).toBeNull();
+    });
+
+    it("bounds and deduplicates external citation payloads", () => {
+        const text = "x".repeat(50_000);
+        const externalSources: ExternalSourceStore = new Map([
+            [
+                "source-0",
+                {
+                    text,
+                    document: {
+                        document_id: "mcp:connector-1:legal-data-hunter:case:1",
+                        title: "Large decision",
+                        type: "case",
+                        metadata: [],
+                        actions: [],
+                        quotes: [],
+                        subdocuments: [
+                            {
+                                document_id:
+                                    "mcp:connector-1:legal-data-hunter:case:1:text",
+                                title: "Decision",
+                                type: "html",
+                                text,
+                            },
+                        ],
+                    },
+                },
+            ],
+        ]);
+        const [parsed] = parseCitations(
+            citationsBlock(
+                '[{"ref": 1, "doc_id": "source-0", "quote": "x"}]',
+            ),
+        );
+        const citation = createCitation(
+            parsed,
+            docIndex,
+            undefined,
+            undefined,
+            externalSources,
+        );
+        if (!citation) throw new Error("Expected an external citation");
+
+        const repeated = Array.from(
+            { length: MAX_EXTERNAL_CITATIONS_PER_RESPONSE + 20 },
+            (_, index) => ({ ...citation, ref: index + 1 }),
+        );
+        repeated.push(repeated[0]);
+        const bounded = boundExternalCitationPayloads(
+            repeated,
+            externalSources,
+        );
+
+        expect(bounded.length).toBeLessThanOrEqual(
+            MAX_EXTERNAL_CITATIONS_PER_RESPONSE,
+        );
+        expect(JSON.stringify(bounded).length).toBeLessThanOrEqual(
+            MAX_EXTERNAL_CITATION_PAYLOAD_CHARS,
+        );
+        expect(boundExternalCitationPayloads([citation, citation], externalSources)).toHaveLength(
+            1,
+        );
     });
 });

@@ -54,7 +54,8 @@ export function useResolvedPanelDocument(document: PanelDocument): {
 
     useEffect(() => {
         const needsHydration =
-            document.type === "case" && !document.subdocuments?.length;
+            (document.type === "case" || document.type === "legislation") &&
+            !document.subdocuments?.length;
         if (!needsHydration) {
             // eslint-disable-next-line react-hooks/set-state-in-effect -- synchronize a new panel input before rendering its viewer
             setResolvedDocument(document);

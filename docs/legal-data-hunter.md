@@ -5,14 +5,11 @@ Mike can connect to Legal Data Hunter through Mike's existing remote MCP connect
 ## Connect
 
 1. Start Mike and sign in.
-2. Open **Settings → Connectors → New MCP connector**.
-3. Select **Use Legal Data Hunter**. Mike fills:
-   - Label: `Legal Data Hunter`
-   - URL: `https://legaldatahunter.com/mcp`
-4. Leave **Bearer token** and **Advanced headers** empty.
-5. Select **Connect**, complete Legal Data Hunter OAuth in the popup, and enable the legal-research tools you want Mike to use.
+2. Open **Settings → Features**.
+3. Under **Legal Research**, turn on **Enable Legal Data Hunter**.
+4. Complete Legal Data Hunter OAuth in the popup using your own Legal Data Hunter account.
 
-Mike accepts remote HTTPS MCP endpoints only. A localhost Legal Data Hunter MCP endpoint cannot be added through the connector UI.
+Mike creates and manages the fixed `https://legaldatahunter.com/mcp` connection behind this feature toggle. Turning the feature off disables that connection without deleting the user's OAuth grant. Legal Data Hunter is intentionally not listed as a preset or editable entry under **Settings → Connectors**; that screen remains for user-supplied MCP servers and URLs.
 
 The OAuth-protected MCP connection and generic Legal Data Hunter tool results are available now. The live Legal Data Hunter server does **not** yet emit the versioned source envelope described below, so native Mike citations remain inactive until that server-side contract is deployed.
 

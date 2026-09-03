@@ -391,6 +391,122 @@ create index if not exists idx_user_mcp_tool_audit_logs_user_created
 
 alter table public.user_mcp_tool_audit_logs enable row level security;
 
+-- Built-in Legal Data Hunter provisioning. The function is service-role-only and
+-- serializes one canonical connector per user without discarding existing OAuth.
+create or replace function public.ensure_legal_data_hunter_connector(
+  p_user_id uuid
+)
+returns setof public.user_mcp_connectors
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  selected public.user_mcp_connectors%rowtype;
+begin
+  perform pg_advisory_xact_lock(
+    hashtextextended('mike:legal-data-hunter:' || p_user_id::text, 0)
+  );
+
+  select connector.*
+  into selected
+  from public.user_mcp_connectors as connector
+  where connector.user_id = p_user_id
+    and connector.server_url = 'https://legaldatahunter.com/mcp'
+  order by
+    exists (
+      select 1
+      from public.user_mcp_oauth_tokens as token
+      where token.connector_id = connector.id
+        and (
+          token.encrypted_access_token is not null
+          or token.encrypted_refresh_token is not null
+        )
+    ) desc,
+    connector.enabled desc,
+    connector.updated_at desc,
+    connector.created_at asc
+  limit 1
+  for update;
+
+  if selected.id is null then
+    insert into public.user_mcp_connectors (
+      user_id,
+      name,
+      transport,
+      server_url,
+      auth_type,
+      enabled,
+      tool_policy
+    )
+    values (
+      p_user_id,
+      'Legal Data Hunter',
+      'streamable_http',
+      'https://legaldatahunter.com/mcp',
+      'none',
+      false,
+      '{}'::jsonb
+    )
+    returning * into selected;
+  else
+    update public.user_mcp_connectors
+    set name = 'Legal Data Hunter',
+        server_url = 'https://legaldatahunter.com/mcp',
+        enabled = exists (
+          select 1
+          from public.user_mcp_oauth_tokens as token
+          where token.connector_id = selected.id
+            and (
+              token.encrypted_access_token is not null
+              or token.encrypted_refresh_token is not null
+            )
+        ),
+        updated_at = now()
+    where id = selected.id
+    returning * into selected;
+  end if;
+
+  update public.user_mcp_connectors
+  set enabled = false,
+      updated_at = now()
+  where user_id = p_user_id
+    and server_url = 'https://legaldatahunter.com/mcp'
+    and id <> selected.id
+    and enabled = true;
+
+  return next selected;
+end;
+$$;
+
+revoke all on function public.ensure_legal_data_hunter_connector(uuid)
+  from public, anon, authenticated;
+grant execute on function public.ensure_legal_data_hunter_connector(uuid)
+  to service_role;
+
+-- Server-only cache for normalized provider documents opened from citations.
+create table if not exists public.user_external_source_documents (
+  user_id uuid not null references auth.users(id) on delete cascade,
+  document_id text not null check (
+    length(document_id) between 1 and 4096
+  ),
+  provider text not null check (provider in ('legal-data-hunter')),
+  document jsonb not null,
+  expires_at timestamptz not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  primary key (user_id, document_id)
+);
+
+create index if not exists user_external_source_documents_expiry_idx
+  on public.user_external_source_documents (expires_at);
+
+alter table public.user_external_source_documents enable row level security;
+revoke all on public.user_external_source_documents
+  from public, anon, authenticated;
+grant select, insert, update, delete
+  on public.user_external_source_documents to service_role;
+
 -- ---------------------------------------------------------------------------
 -- Projects and documents
 -- ---------------------------------------------------------------------------

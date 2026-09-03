@@ -38,10 +38,42 @@ import {
 } from "./types";
 import {
     extractExternalLegalSources,
+    LEGAL_DATA_HUNTER_MCP_URL,
     type ExternalLegalSource,
 } from "./sourceDocuments";
 
 export { startUserMcpConnectorOAuth, validateRemoteMcpUrl };
+
+function comparableMcpEndpoint(value: URL): string | null {
+    let pathname: string;
+    try {
+        pathname = decodeURIComponent(value.pathname)
+            .replace(/\/{2,}/g, "/")
+            .replace(/\/+$/, "");
+    } catch {
+        return null;
+    }
+    const hostname = value.hostname.toLowerCase().replace(/\.$/, "");
+    let port = value.port;
+    if (!port && value.protocol === "https:") port = "443";
+    if (!port && value.protocol === "http:") port = "80";
+    return `${value.protocol}//${hostname}:${port}${pathname}`;
+}
+
+function assertCustomMcpUrl(serverUrl: string): void {
+    let candidate: URL;
+    try {
+        candidate = new URL(serverUrl.trim());
+    } catch {
+        return;
+    }
+    const managed = new URL(LEGAL_DATA_HUNTER_MCP_URL);
+    if (comparableMcpEndpoint(candidate) === comparableMcpEndpoint(managed)) {
+        throw new Error(
+            "Legal Data Hunter is managed in Settings → Features.",
+        );
+    }
+}
 
 async function withMcpClient<T>(
     connector: ConnectorRow,
@@ -217,6 +249,7 @@ export async function createUserMcpConnector(
 ): Promise<McpConnectorSummary> {
     const name = input.name.trim().slice(0, 80);
     if (!name) throw new Error("Connector name is required.");
+    assertCustomMcpUrl(input.serverUrl);
     const serverUrl = await validateRemoteMcpUrl(input.serverUrl.trim());
     const headers = validateCustomHeaders(input.headers);
     const auth = authConfigPatch({
@@ -243,6 +276,23 @@ export async function createUserMcpConnector(
     return toConnectorSummary(data as ConnectorRow);
 }
 
+export async function ensureUserLegalDataHunterConnector(
+    userId: string,
+    db: Db = createServerSupabase(),
+): Promise<McpConnectorSummary> {
+    const { data, error } = await db.rpc("ensure_legal_data_hunter_connector", {
+        p_user_id: userId,
+    });
+    if (error) throw error;
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row) {
+        throw new Error(
+            "Legal Data Hunter connector could not be provisioned.",
+        );
+    }
+    return toConnectorSummary(row as ConnectorRow);
+}
+
 export async function updateUserMcpConnector(
     userId: string,
     connectorId: string,
@@ -264,6 +314,7 @@ export async function updateUserMcpConnector(
         update.name = name;
     }
     if (typeof input.serverUrl === "string") {
+        assertCustomMcpUrl(input.serverUrl);
         update.server_url = await validateRemoteMcpUrl(input.serverUrl.trim());
     }
     if (typeof input.enabled === "boolean") {
@@ -596,6 +647,7 @@ export async function executeMcpToolCall(
                 serverUrl: connector.server_url,
             },
             serialized.wasTruncated,
+            { toolName: tool.tool_name, arguments: args },
         );
         const content = serialized.content;
         await insertMcpAuditLog(db, {
