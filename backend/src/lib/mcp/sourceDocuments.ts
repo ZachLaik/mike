@@ -446,7 +446,10 @@ export function extractExternalLegalSources(
     return [];
   }
 
-  if (!isRecord(result.structuredContent)) {
+  const envelope = isRecord(result.structuredContent)
+    ? result.structuredContent
+    : null;
+  if (!envelope || envelope.schema === undefined) {
     return context
       ? extractLegalDataHunterJsonSources(
           result,
@@ -455,7 +458,6 @@ export function extractExternalLegalSources(
         )
       : [];
   }
-  const envelope = result.structuredContent;
   if (envelope.schema !== LEGAL_SOURCES_SCHEMA) return [];
   if (!Array.isArray(envelope.sources)) return [];
 

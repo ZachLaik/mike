@@ -351,6 +351,41 @@ describe("turn-scoped external source registration", () => {
     });
   });
 
+  it("registers trusted LDH JSON when the MCP SDK also returns structured content", () => {
+    const payload = {
+      query: "contract formation",
+      total_hits: 1,
+      elapsed_ms: 12,
+      hits: [
+        {
+          source: "FR/CASS",
+          source_id: "JURITEXT000006994248",
+          title: "Cour de cassation, 27 octobre 1975",
+          snippet: "The agreement was formed when acceptance was received.",
+        },
+      ],
+    };
+
+    const sources = extractExternalLegalSources(
+      {
+        isError: false,
+        structuredContent: payload,
+        content: [{ type: "text", text: JSON.stringify(payload) }],
+      },
+      PROVENANCE,
+      false,
+      { toolName: "search", arguments: { namespace: "case_law" } },
+    );
+
+    expect(sources).toHaveLength(1);
+    expect(registerExternalLegalSources(new Map(), sources)).toEqual([
+      expect.objectContaining({
+        handle: "source-0",
+        type: "case",
+      }),
+    ]);
+  });
+
   it("normalizes a trusted LDH get_document result as hydrated", () => {
     const sources = extractExternalLegalSources(
       {
