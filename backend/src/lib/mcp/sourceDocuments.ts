@@ -27,6 +27,15 @@ function text(value: unknown, max = 2_048): string | null {
     return result && result.length <= max ? result : null;
 }
 
+function identifier(value: unknown, max = 2_048): string | null {
+    return typeof value === "string" &&
+        value === value.trim() &&
+        value.length > 0 &&
+        value.length <= max
+        ? value
+        : null;
+}
+
 function isLegalDataHunterUrl(value: string): boolean {
     try {
         const url = new URL(value);
@@ -74,8 +83,8 @@ export function extractLegalDataHunterSource(
     }
 
     const payload = resultPayload(result);
-    const provider = text(payload?.source);
-    const providerId = text(payload?.source_id);
+    const provider = identifier(payload?.source);
+    const providerId = identifier(payload?.source_id);
     const title = text(payload?.title, 500);
     const sourceUrl = text(payload?.url);
     const body =
@@ -112,13 +121,13 @@ export function extractLegalDataHunterSource(
         !officialUrl ||
         ("text_truncated" in (payload ?? {}) &&
             payload?.text_truncated !== false) ||
-        text(context.arguments.source) !== provider ||
-        text(context.arguments.source_id) !== providerId
+        identifier(context.arguments.source) !== provider ||
+        identifier(context.arguments.source_id) !== providerId
     ) {
         return null;
     }
 
-    const documentId = `mcp:${context.connectorId}:${provider}:${providerId}`;
+    const documentId = `mcp:${context.connectorId}:${provider.length}:${provider}:${providerId.length}:${providerId}`;
     return {
         text: body,
         document: {

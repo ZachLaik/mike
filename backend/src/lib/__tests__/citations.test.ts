@@ -4,6 +4,9 @@ import {
     parseCitationsWithDiagnostics,
     parsePartialCitationObjects,
     createCitation,
+    limitCitationPayload,
+    MAX_CITATION_PAYLOAD_BYTES,
+    MAX_PARSED_CITATIONS,
     CITATIONS_OPEN_TAG,
     CITATIONS_CLOSE_TAG,
 } from "../chat/citations";
@@ -13,11 +16,41 @@ function citationsBlock(json: string) {
     return `Answer text.\n${CITATIONS_OPEN_TAG}\n${json}\n${CITATIONS_CLOSE_TAG}`;
 }
 
+describe("limitCitationPayload", () => {
+    it("drops entries that would exceed the serialized payload budget", () => {
+        const retained = { ref: 2, quote: "small" };
+
+        expect(
+            limitCitationPayload([
+                { body: "x".repeat(MAX_CITATION_PAYLOAD_BYTES) },
+                retained,
+            ]),
+        ).toEqual([retained]);
+    });
+});
+
 // ---------------------------------------------------------------------------
 // parseCitationsWithDiagnostics
 // ---------------------------------------------------------------------------
 
 describe("parseCitationsWithDiagnostics", () => {
+    it("caps the number of parsed citations", () => {
+        const citations = Array.from(
+            { length: MAX_PARSED_CITATIONS + 1 },
+            (_, index) => ({
+                ref: index + 1,
+                doc_id: "doc-1",
+                quote: "quoted text",
+            }),
+        );
+
+        expect(
+            parseCitationsWithDiagnostics(
+                citationsBlock(JSON.stringify(citations)),
+            ).citations,
+        ).toHaveLength(MAX_PARSED_CITATIONS);
+    });
+
     it("reports no block when the tags are absent", () => {
         const { citations, diagnostics } =
             parseCitationsWithDiagnostics("plain answer");

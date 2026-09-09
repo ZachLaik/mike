@@ -28,7 +28,8 @@ describe("Legal Data Hunter source documents", () => {
         expect(source).toMatchObject({
             text: "Exact source text",
             document: {
-                document_id: "mcp:connector-1:legifrance:JORFTEXT0001",
+                document_id:
+                    "mcp:connector-1:10:legifrance:12:JORFTEXT0001",
                 title: "Code civil, article 1103",
                 type: "legislation",
                 actions: [{ label: "Official source" }],
@@ -74,5 +75,55 @@ describe("Legal Data Hunter source documents", () => {
                 arguments: { source: "other", source_id: "JORFTEXT0001" },
             }),
         ).toBeNull();
+        expect(
+            extractLegalDataHunterSource(
+                {
+                    structuredContent: {
+                        ...result.structuredContent,
+                        source: " legifrance",
+                    },
+                },
+                {
+                    ...context,
+                    arguments: {
+                        source: " legifrance",
+                        source_id: "JORFTEXT0001",
+                    },
+                },
+            ),
+        ).toBeNull();
+    });
+
+    it("uses unambiguous document identities", () => {
+        const first = extractLegalDataHunterSource(
+            {
+                structuredContent: {
+                    ...result.structuredContent,
+                    source: "a:b",
+                    source_id: "c",
+                },
+            },
+            {
+                ...context,
+                arguments: { source: "a:b", source_id: "c" },
+            },
+        );
+        const second = extractLegalDataHunterSource(
+            {
+                structuredContent: {
+                    ...result.structuredContent,
+                    source: "a",
+                    source_id: "b:c",
+                },
+            },
+            {
+                ...context,
+                arguments: { source: "a", source_id: "b:c" },
+            },
+        );
+
+        expect(first?.document.document_id).not.toBe(
+            second?.document.document_id,
+        );
     });
 });
