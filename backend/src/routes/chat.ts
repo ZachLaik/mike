@@ -6,14 +6,14 @@ import { enqueueChatTurnAudit } from "../lib/audit";
 import {
     buildDocContext,
     buildMessages,
-    buildUserPersonalisationPrompt,
-    enrichWithPriorEvents,
-    buildWorkflowStore,
-    appendAskInputsResponseToLastAssistantMessage,
-    appendAssistantEventsToLastAssistantMessage,
-    AssistantStreamError,
-    ASSISTANT_ERROR_MESSAGE,
-    buildCancelledAssistantMessage,
+  buildUserPersonalisationPrompt,
+  enrichWithPriorEvents,
+  buildWorkflowStore,
+  appendAskInputsResponseToAssistantMessage,
+  appendAssistantEventsToMessage,
+  AssistantStreamError,
+  ASSISTANT_ERROR_MESSAGE,
+  buildCancelledAssistantMessage,
     extractCitations,
     generateSpotlightNonce,
     isAbortError,
@@ -36,16 +36,18 @@ import {
     persistLastSelectedReasoningLevel,
 } from "../lib/userSettings";
 import {
-    checkProjectAccess,
-    ensureChatAccess,
-    normalizeEmail,
-    resolveContentOrgId,
+  checkProjectAccess,
+  ensureChatAccess,
+  normalizeEmail,
+  projectHasSharedAudience,
+  resolveContentOrgId,
 } from "../lib/access";
 import { loadProfileUsersByEmail } from "../lib/userLookup";
 import {
-    deleteContentGrant,
-    listContentGrants,
-    upsertContentGrant,
+  deleteContentGrant,
+  hasDirectContentGrants,
+  listContentGrants,
+  upsertContentGrant,
 } from "../lib/contentAccess";
 import { can, type ProjectRole } from "../lib/permissions";
 import { listContentPeople } from "../lib/resourcePeople";
@@ -56,6 +58,12 @@ import {
     resolveEffectiveReasoningLevel,
     titleModelForChat,
 } from "../lib/modelSelection";
+import {
+  beginMemoryConversationTurn,
+  releaseMemoryConversationTurn,
+  scheduleMemoryConsolidation,
+  type MemoryConversationTurn,
+} from "../lib/memory/schedule";
 
 export const chatRouter = Router();
 
@@ -386,14 +394,13 @@ async function hydrateEditStatuses(
     for (const m of messages) {
         const content = m.content;
         if (Array.isArray(content)) {
-            for (const ev of content as Record<string, unknown>[]) {
-                if (ev?.type === "doc_edited") {
-                    collectFromAnnList(ev.annotations);
-                    if (typeof ev.version_id === "string")
-                        versionIds.add(ev.version_id);
-                }
-            }
+      for (const ev of content as Record<string, unknown>[]) {
+        if (ev?.type === "doc_edited") {
+          collectFromAnnList(ev.annotations);
+          if (typeof ev.version_id === "string") versionIds.add(ev.version_id);
         }
+      }
+    }
     }
     if (editIds.size === 0 && versionIds.size === 0) return messages;
 
@@ -451,32 +458,29 @@ async function hydrateEditStatuses(
             return next;
         });
     };
-    return messages.map((m) => {
-        const next: Record<string, unknown> = { ...m };
-        if (Array.isArray(m.content)) {
-            next.content = (m.content as Record<string, unknown>[]).map(
-                (ev) => {
-                    if (ev?.type !== "doc_edited") return ev;
-                    let patched: Record<string, unknown> = {
-                        ...ev,
+  return messages.map((m) => {
+    const next: Record<string, unknown> = { ...m };
+    if (Array.isArray(m.content)) {
+      next.content = (m.content as Record<string, unknown>[]).map((ev) => {
+        if (ev?.type !== "doc_edited") return ev;
+        let patched: Record<string, unknown> = {
+          ...ev,
                         annotations: patchAnnList(ev.annotations),
                     };
                     if (
                         typeof ev.version_id === "string" &&
                         versionNumberById.has(ev.version_id)
-                    ) {
-                        patched = {
-                            ...patched,
-                            version_number:
-                                versionNumberById.get(ev.version_id) ?? null,
-                        };
-                    }
-                    return patched;
-                },
-            );
+        ) {
+          patched = {
+            ...patched,
+            version_number: versionNumberById.get(ev.version_id) ?? null,
+          };
         }
-        return next;
-    });
+        return patched;
+      });
+    }
+    return next;
+  });
 }
 
 // PATCH /chat/:chatId — rename and/or edit sharing.
@@ -494,15 +498,13 @@ chatRouter.patch("/:chatId", requireAuth, async (req, res) => {
     // `String(req.body.title)` accepts anything: `{}` becomes the literal
     // title "[object Object]" and `42` becomes "42", so a client bug is
     // stored as data and discovered later by a human reading a nonsense chat
-    // name. Refusing names the problem while it is still fixable.
-    if (body.title != null) {
-        if (typeof body.title !== "string")
-            return void res
-                .status(400)
-                .json({ detail: "title must be a string" });
-        const title = body.title.trim();
-        if (!title)
-            return void res.status(400).json({ detail: "title is required" });
+  // name. Refusing names the problem while it is still fixable.
+  if (body.title != null) {
+    if (typeof body.title !== "string")
+      return void res.status(400).json({ detail: "title must be a string" });
+    const title = body.title.trim();
+    if (!title)
+      return void res.status(400).json({ detail: "title is required" });
         updates.title = title;
     }
     if ("shared_with" in body)
@@ -533,16 +535,13 @@ chatRouter.patch("/:chatId", requireAuth, async (req, res) => {
     // Title edits are content collaboration (the same tier that already
     // rewrites titles via generate-title).
     if (updates.title != null && !can(access.projectRole, "content.edit"))
-        return void res
-            .status(403)
-            .json({ detail: "You do not have permission to modify this chat" });
-    if (
-        (hasModel || hasReasoning) &&
-        !can(access.projectRole, "content.edit")
-    )
-        return void res
-            .status(403)
-            .json({ detail: "You do not have permission to modify this chat" });
+    return void res
+      .status(403)
+      .json({ detail: "You do not have permission to modify this chat" });
+  if ((hasModel || hasReasoning) && !can(access.projectRole, "content.edit"))
+    return void res
+      .status(403)
+      .json({ detail: "You do not have permission to modify this chat" });
 
     if (hasModel) {
         const settings = await getUserModelSettings(userId, db);
@@ -720,6 +719,7 @@ chatRouter.post("/", requireAuth, async (req, res) => {
     // Reserve a stable assistant identity before streaming. This lets clients
     // associate streamed UI with the same durable message after a reload.
     const assistantMessageId = askInputsResponse ? null : randomUUID();
+    const inputMessageId = askInputsResponse ? null : randomUUID();
 
     devLog("[chat/stream] incoming request", {
         userId,
@@ -736,6 +736,9 @@ chatRouter.post("/", requireAuth, async (req, res) => {
     let chatModel: string | null = null;
     let chatReasoningLevel: string | null = null;
     let resolvedProjectId: string | null = parsedProjectId.value.projectId;
+    let canReadProjectMemory = false;
+    let canCurateProjectMemory = false;
+    let memorySharedAudience = false;
     // Whether the document-writing tools are offered this turn. A standalone
     // chat writes into the caller's own library, so it keeps them; a project
     // chat writes into the PROJECT, and that is a question about the caller's
@@ -764,12 +767,16 @@ chatRouter.post("/", requireAuth, async (req, res) => {
         ) {
             return void res
                 .status(400)
-                .json({ detail: "project_id does not match chat" });
-        }
-        resolvedProjectId = existingProjectId;
-        chatTitle = existing.title;
-        chatModel = existing.model;
-        chatReasoningLevel = existing.reasoning_level;
+        .json({ detail: "project_id does not match chat" });
+    }
+    resolvedProjectId = existingProjectId;
+    memorySharedAudience =
+      !!existing.org_id ||
+      existing.user_id !== userId ||
+      (await hasDirectContentGrants(db, "chat", existing.id));
+    chatTitle = existing.title;
+    chatModel = existing.model;
+    chatReasoningLevel = existing.reasoning_level;
         if (existingProjectId) {
             // The role above may have come from the chat's own share list;
             // creating documents in the project needs the project's verdict.
@@ -778,12 +785,22 @@ chatRouter.post("/", requireAuth, async (req, res) => {
                 userId,
                 userEmail,
                 db,
-            );
-            allowDocumentMutation =
-                projectAccess.ok &&
-                can(projectAccess.projectRole, "content.edit");
-        }
+      );
+      canReadProjectMemory = projectAccess.ok;
+      canCurateProjectMemory =
+        projectAccess.ok && can(projectAccess.projectRole, "content.edit");
+      allowDocumentMutation = canCurateProjectMemory;
+      if (projectAccess.ok) {
+        memorySharedAudience =
+          memorySharedAudience ||
+          (await projectHasSharedAudience(
+            db,
+            existingProjectId,
+            projectAccess.project.org_id,
+          ));
+      }
     }
+  }
 
     const modelSettings = await getUserModelSettings(userId, db);
     const modelResolution = await resolveEffectiveChatModel({
@@ -835,16 +852,20 @@ chatRouter.post("/", requireAuth, async (req, res) => {
         if (!projectAccess.ok)
             return void res
                 .status(projectAccess.status)
-                .json({ detail: projectAccess.detail });
+        .json({ detail: projectAccess.detail });
+    canReadProjectMemory = resolvedProjectId !== null;
+    canCurateProjectMemory = resolvedProjectId !== null;
 
-        const resolvedOrg = await resolveContentOrgId(db, {
-            projectId: resolvedProjectId,
-        });
-        if (!resolvedOrg.ok)
-            return void sendInternalError(res, resolvedOrg.detail);
-        const { data: newChat, error } = await db
-            .from("chats")
-            .insert({
+    const resolvedOrg = await resolveContentOrgId(db, {
+      projectId: resolvedProjectId,
+    });
+    if (!resolvedOrg.ok) return void sendInternalError(res, resolvedOrg.detail);
+    memorySharedAudience = resolvedProjectId
+      ? await projectHasSharedAudience(db, resolvedProjectId, resolvedOrg.orgId)
+      : false;
+    const { data: newChat, error } = await db
+      .from("chats")
+      .insert({
                 user_id: userId,
                 project_id: resolvedProjectId,
                 model: selectedModel,
@@ -852,42 +873,83 @@ chatRouter.post("/", requireAuth, async (req, res) => {
                 org_id: resolvedOrg.orgId,
             })
             .select("id, title")
-            .single();
-        if (error || !newChat) {
-            console.error("[chat/stream] failed to create chat", error);
-            return void res
-                .status(500)
-                .json({ detail: "Failed to create chat" });
-        }
-        chatId = newChat.id as string;
-        chatTitle = newChat.title;
+      .single();
+    if (error || !newChat) {
+      console.error("[chat/stream] failed to create chat", error);
+      return void res.status(500).json({ detail: "Failed to create chat" });
     }
+    chatId = newChat.id as string;
+    chatTitle = newChat.title;
+  }
 
-    if (!chatId) {
-        return void res
-            .status(500)
-            .json({ detail: "Failed to initialize chat" });
-    }
+  if (!chatId) {
+    return void res.status(500).json({ detail: "Failed to initialize chat" });
+  }
 
-    devLog("[chat/stream] resolved chatId", chatId);
+  devLog("[chat/stream] resolved chatId", chatId);
 
     const lastUser = [...messages].reverse().find((m) => m.role === "user");
-    if (askInputsResponse) {
-        await appendAskInputsResponseToLastAssistantMessage(
-            db,
-            chatId,
-            askInputsResponse,
-        );
+  let completedTurnPersisted = true;
+  let memoryTurn: MemoryConversationTurn | null = null;
+  let memoryTurnScheduled = false;
+  if (askInputsResponse) {
+    const appendResult = await appendAskInputsResponseToAssistantMessage(
+      db,
+      chatId,
+      askInputsResponse,
+        userId,
+    );
+    if (appendResult === "forbidden") {
+      return void res.status(403).json({
+        detail:
+          "Only the user who started this turn can answer these questions",
+      });
+    }
+    if (appendResult === "invalid") {
+      return void res.status(400).json({
+        detail: "The answers do not match the pending questions",
+      });
+    }
+    if (appendResult === "stale") {
+      return void res.status(409).json({
+        code: "ask_inputs_stale",
+        detail:
+          "These questions have already been answered or are no longer active",
+      });
+    }
+    completedTurnPersisted = appendResult === "appended";
+    if (!completedTurnPersisted) {
+      return void res.status(500).json({ detail: "Failed to save message" });
+    }
     } else if (lastUser) {
-        await db.from("chat_messages").insert({
+    const { error: userMessageError } = await db.from("chat_messages").insert({
+      id: inputMessageId,
             chat_id: chatId,
             role: "user",
             content: lastUser.content,
             files: lastUser.files ?? null,
             workflow: lastUser.workflow ?? null,
+      author_user_id: userId,
+    });
+    if (userMessageError) {
+      return void sendInternalError(res, userMessageError);
+    }
+  }
+
+  if (askInputsResponse || lastUser) {
+    try {
+      memoryTurn = await beginMemoryConversationTurn({
+        db,
+        surface: "chat",
+        conversationId: chatId,
+        actorUserId: userId,
         });
+    } catch (error) {
+      return void sendInternalError(res, error);
+    }
     }
 
+  try {
     const { docIndex, docStore } = await buildDocContext(
         messages,
         userId,
@@ -945,6 +1007,8 @@ chatRouter.post("/", requireAuth, async (req, res) => {
             table: "chat_messages",
             id: assistantMessageId,
             chatId,
+        inputMessageId: inputMessageId as string,
+        authorUserId: userId,
         });
         if (reserveError) {
             console.error(
@@ -979,15 +1043,13 @@ chatRouter.post("/", requireAuth, async (req, res) => {
 
         const shouldGenerateTitle =
             !chatTitle && !!lastUser?.content && !askInputsResponse;
-        const titleMessage = lastUser
-            ? [
-                  lastUser.content,
-                  lastUser.workflow
-                      ? `Workflow: ${lastUser.workflow.title}`
-                      : "",
-                  lastUser.files?.length
-                      ? `Files: ${lastUser.files.map((file) => file.filename).join(", ")}`
-                      : "",
+      const titleMessage = lastUser
+        ? [
+            lastUser.content,
+            lastUser.workflow ? `Workflow: ${lastUser.workflow.title}` : "",
+            lastUser.files?.length
+              ? `Files: ${lastUser.files.map((file) => file.filename).join(", ")}`
+              : "",
               ]
                   .filter(Boolean)
                   .join("\n")
@@ -1034,6 +1096,9 @@ chatRouter.post("/", requireAuth, async (req, res) => {
             apiKeys,
             signal: stream.signal,
             projectId: resolvedProjectId,
+            includeMemory: true,
+            memoryProjectId: canReadProjectMemory ? resolvedProjectId : null,
+            memorySharedAudience,
             nonce,
             // This route first makes the advertised assistant ID durable.
             // It emits [DONE] only after the reserved row has been populated.
@@ -1051,6 +1116,7 @@ chatRouter.post("/", requireAuth, async (req, res) => {
         // their own completion signal.
         if (
             !fullText?.trim() &&
+            !events?.some((event) => event.type === "ask_inputs") &&
             (!events || events.every((event) => !("error" in event)))
         ) {
             write(
@@ -1065,14 +1131,17 @@ chatRouter.post("/", requireAuth, async (req, res) => {
             return;
         }
 
-        const persistedEvents = stripTransientAssistantEvents(events);
-        if (askInputsResponse) {
-            await appendAssistantEventsToLastAssistantMessage(
-                db,
-                chatId,
-                persistedEvents,
-                citations,
-            );
+      const persistedEvents = stripTransientAssistantEvents(events);
+      if (askInputsResponse) {
+        const appended = await appendAssistantEventsToMessage(
+          db,
+          chatId,
+          askInputsResponse.assistant_message_id,
+          userId,
+          persistedEvents,
+          citations,
+        );
+        completedTurnPersisted = appended;
         } else {
             const saveError = await updateReservedAssistantMessage(
                 persistedEvents.length ? persistedEvents : null,
@@ -1083,14 +1152,13 @@ chatRouter.post("/", requireAuth, async (req, res) => {
                     "[chat/stream] failed to save assistant response",
                     saveError,
                 );
-                write(
-                    `data: ${JSON.stringify({
-                        type: "error",
-                        message:
-                            "The response was generated but could not be saved.",
-                    })}\n\n`,
-                );
-                write("data: [DONE]\n\n");
+          write(
+            `data: ${JSON.stringify({
+              type: "error",
+              message: "The response was generated but could not be saved.",
+            })}\n\n`,
+          );
+          write("data: [DONE]\n\n");
                 return;
             }
         }
@@ -1107,6 +1175,31 @@ chatRouter.post("/", requireAuth, async (req, res) => {
                 );
             }
         }
+
+      // ask_inputs is an intentional pause, not a completed conversation.
+      // A continuation reuses the preceding assistant row, so resolve that
+      // durable identity only when there is no newly reserved message id.
+      if (
+        completedTurnPersisted &&
+        !persistedEvents.some(
+          (event) => event.type === "ask_inputs" || event.type === "error",
+        )
+      ) {
+        const completedTurnId =
+          assistantMessageId ?? askInputsResponse?.assistant_message_id ?? null;
+        if (completedTurnId) {
+          const scheduled = await scheduleMemoryConsolidation({
+            db,
+            surface: "chat",
+            conversationId: chatId,
+            actorUserId: userId,
+            projectId: canCurateProjectMemory ? resolvedProjectId : null,
+            turnId: completedTurnId,
+            turn: memoryTurn,
+          });
+          memoryTurnScheduled = scheduled != null;
+        }
+      }
         void enqueueChatTurnAudit(
             db,
             {
@@ -1137,25 +1230,26 @@ chatRouter.post("/", requireAuth, async (req, res) => {
                 null,
             );
             if (err instanceof AssistantStreamError) {
-                const partial = buildCancelledAssistantMessage({
-                    fullText: err.fullText,
-                    events: err.events,
-                    buildCitations: (fullText) =>
-                        extractCitations(fullText, docIndex),
-                });
-                const saveError = askInputsResponse
-                    ? null
+          const partial = buildCancelledAssistantMessage({
+            fullText: err.fullText,
+            events: err.events,
+            buildCitations: (fullText) => extractCitations(fullText, docIndex),
+          });
+          const saveError = askInputsResponse
+            ? null
                     : await updateReservedAssistantMessage(
                           partial.events.length ? partial.events : null,
-                          partial.citations.length ? partial.citations : null,
-                      );
-                if (askInputsResponse) {
-                    await appendAssistantEventsToLastAssistantMessage(
-                        db,
-                        chatId,
-                        partial.events,
-                        partial.citations,
-                    );
+                partial.citations.length ? partial.citations : null,
+              );
+          if (askInputsResponse) {
+            await appendAssistantEventsToMessage(
+              db,
+              chatId,
+              askInputsResponse.assistant_message_id,
+              userId,
+              partial.events,
+              partial.citations,
+            );
                 }
                 if (saveError) {
                     console.error(
@@ -1180,15 +1274,17 @@ chatRouter.post("/", requireAuth, async (req, res) => {
                 ? null
                 : await updateReservedAssistantMessage(
                       errorEvents.length ? errorEvents : null,
-                      citations.length ? citations : null,
-                  );
-            if (askInputsResponse) {
-                await appendAssistantEventsToLastAssistantMessage(
-                    db,
-                    chatId,
-                    errorEvents,
-                    citations,
-                );
+              citations.length ? citations : null,
+            );
+        if (askInputsResponse) {
+          await appendAssistantEventsToMessage(
+            db,
+            chatId,
+            askInputsResponse.assistant_message_id,
+            userId,
+            errorEvents,
+            citations,
+          );
             }
             if (saveError)
                 console.error("[chat/stream] failed to save error", saveError);
@@ -1204,4 +1300,20 @@ chatRouter.post("/", requireAuth, async (req, res) => {
     } finally {
         stream.finish();
     }
+  } finally {
+    if (memoryTurn && !memoryTurnScheduled) {
+      try {
+        await releaseMemoryConversationTurn({
+          db,
+          surface: "chat",
+          conversationId: chatId,
+          turn: memoryTurn,
+        });
+      } catch {
+        console.warn("[memory] chat activity release failed", {
+          chatId,
+        });
+      }
+    }
+  }
 });

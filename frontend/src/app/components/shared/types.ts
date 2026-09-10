@@ -70,6 +70,8 @@ export interface Project {
   name: string;
   cm_number: string | null;
   practice: string | null;
+  /** Whether this project's shared memory.md is active. */
+  memory_enabled: boolean;
   created_at: string;
   updated_at: string;
   documents?: Document[];
@@ -188,6 +190,8 @@ export type AskInputsEvent = SharedAskInputsEvent;
 
 export type AskInputsResponseEvent = {
   type: "ask_inputs_response";
+  assistant_message_id: string;
+  ask_event_id: string;
   responses: AskInputResponseItem[];
 };
 

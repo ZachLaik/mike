@@ -11,16 +11,35 @@ vi.hoisted(() => {
 
 // Hoisted mock fn so the vi.mock factory below (which is itself hoisted above
 // the imports) can reference it. Lets each test drive the stream outcome.
-const { runLLMStream, dbInserts, dbUpdates, dbControl } = vi.hoisted(() => ({
-    runLLMStream: vi.fn(),
+const {
+  runLLMStream,
+  beginMemoryConversationTurn,
+  releaseMemoryConversationTurn,
+  scheduleMemoryConsolidation,
+  dbInserts,
+  dbUpdates,
+  dbRpcCalls,
+  dbControl,
+} = vi.hoisted(() => ({
+  runLLMStream: vi.fn(),
+  beginMemoryConversationTurn: vi.fn().mockResolvedValue({
+    activityId: "activity-1",
+  }),
+  releaseMemoryConversationTurn: vi.fn().mockResolvedValue(undefined),
+  scheduleMemoryConsolidation: vi.fn().mockResolvedValue({
+    job_id: "job-1",
+    generation: 1,
+  }),
     dbInserts: [] as { table: string; value: unknown }[],
     dbUpdates: [] as {
         table: string;
-        value: unknown;
-        filters: { column: string; value: unknown }[];
-    }[],
-    dbControl: {
-        failAssistantReservation: false,
+    value: unknown;
+    filters: { column: string; value: unknown }[];
+  }[],
+  dbRpcCalls: [] as { name: string; args: unknown }[],
+  dbControl: {
+    failUserMessageInsert: false,
+    failAssistantReservation: false,
         terminalUpdateFailures: 0,
         terminalUpdateAttempts: 0,
         terminalUpdateGate: null as Promise<void> | null,
@@ -97,6 +116,16 @@ function makeQuery(table: string) {
     });
     q.insert = vi.fn((value: unknown) => {
         dbInserts.push({ table, value });
+    if (
+      dbControl.failUserMessageInsert &&
+      table === "chat_messages" &&
+      (value as { role?: unknown }).role === "user"
+    ) {
+      result = {
+        data: null,
+        error: { message: "user message insert failed" },
+      };
+    }
         if (
             dbControl.failAssistantReservation &&
             table === "chat_messages" &&
@@ -117,19 +146,32 @@ function makeQuery(table: string) {
     q.eq = vi.fn((column: string, value: unknown) => {
         if (activeUpdate) activeUpdate.filters.push({ column, value });
         else selectState.filters.push({ column, op: "eq", value });
-        return q;
-    });
-    q.single = vi.fn(() => Promise.resolve(result));
-    q.maybeSingle = vi.fn(() =>
-        Promise.resolve(
-            table === "word_chats" && dbControl.wordChatMissing
-                ? { data: null, error: null }
-                : result,
-        ),
+    return q;
+  });
+  q.single = vi.fn(() => Promise.resolve(result));
+  q.maybeSingle = vi.fn(() => {
+    if (
+      didSelect &&
+      table === "chat_messages" &&
+      dbControl.assistantMessageRows
+    ) {
+      let rows = [...dbControl.assistantMessageRows];
+      for (const filter of selectState.filters) {
+        if (filter.op === "eq") {
+          rows = rows.filter((row) => row[filter.column] === filter.value);
+        }
+      }
+      return Promise.resolve({ data: rows[0] ?? null, error: null });
+    }
+    return Promise.resolve(
+      table === "word_chats" && dbControl.wordChatMissing
+        ? { data: null, error: null }
+        : result,
     );
-    q.then = (
-        resolve: (v: unknown) => unknown,
-        reject?: (e: unknown) => unknown,
+  });
+  q.then = (
+    resolve: (v: unknown) => unknown,
+    reject?: (e: unknown) => unknown,
     ) => {
         const resolveQuery = async () => {
             if (activeUpdate?.table === "chat_messages") {
@@ -138,8 +180,7 @@ function makeQuery(table: string) {
                     await dbControl.terminalUpdateGate;
                 }
                 if (
-                    dbControl.terminalUpdateAttempts <=
-                    dbControl.terminalUpdateFailures
+          dbControl.terminalUpdateAttempts <= dbControl.terminalUpdateFailures
                 ) {
                     return {
                         data: null,
@@ -184,18 +225,33 @@ function makeQuery(table: string) {
 }
 
 function mockSupabase() {
-    return {
-        from: vi.fn((table: string) => makeQuery(table)),
-        rpc: vi.fn(() => Promise.resolve({ data: null, error: null })),
-        auth: {
-            getUser: () =>
-                Promise.resolve({ data: { user: { id: "u1" } }, error: null }),
+  return {
+    from: vi.fn((table: string) => makeQuery(table)),
+    rpc: vi.fn((name: string, args: unknown) => {
+      dbRpcCalls.push({ name, args });
+      return Promise.resolve({
+        data: name.startsWith("append_chat_") ? "appended" : null,
+        error: null,
+      });
+    }),
+    auth: {
+      getUser: () =>
+        Promise.resolve({ data: { user: { id: "u1" } }, error: null }),
         },
     };
 }
 
 vi.mock("../../lib/supabase", () => ({
     createServerSupabase: vi.fn(() => mockSupabase()),
+}));
+
+vi.mock("../../lib/memory/schedule", () => ({
+  beginMemoryConversationTurn: (...args: unknown[]) =>
+    beginMemoryConversationTurn(...args),
+  releaseMemoryConversationTurn: (...args: unknown[]) =>
+    releaseMemoryConversationTurn(...args),
+  scheduleMemoryConsolidation: (...args: unknown[]) =>
+    scheduleMemoryConsolidation(...args),
 }));
 
 // Authenticate every request as user "u1" without exercising the real Supabase
@@ -287,11 +343,13 @@ function findAssistantUpdate() {
 
 describe("POST /chat — streaming endpoint", () => {
     beforeEach(() => {
-        vi.clearAllMocks();
-        dbInserts.length = 0;
-        dbUpdates.length = 0;
-        dbControl.failAssistantReservation = false;
-        dbControl.terminalUpdateFailures = 0;
+    vi.clearAllMocks();
+    dbInserts.length = 0;
+    dbUpdates.length = 0;
+    dbRpcCalls.length = 0;
+    dbControl.failUserMessageInsert = false;
+    dbControl.failAssistantReservation = false;
+    dbControl.terminalUpdateFailures = 0;
         dbControl.terminalUpdateAttempts = 0;
         dbControl.terminalUpdateGate = null;
         dbControl.wordChatMissing = false;
@@ -326,7 +384,10 @@ describe("POST /chat — streaming endpoint", () => {
         expect(res.text).toContain('"type":"chat_title"');
         expect(runLLMStream).toHaveBeenCalledTimes(1);
         expect(runLLMStream).toHaveBeenCalledWith(
-            expect.objectContaining({ emitDone: false }),
+            expect.objectContaining({
+                emitDone: false,
+                memorySharedAudience: false,
+            }),
         );
         const systemPromptExtra = vi.mocked(chatLib.buildMessages).mock
             .calls[0]?.[2] as string;
@@ -342,18 +403,30 @@ describe("POST /chat — streaming endpoint", () => {
                 .find((line) => line.includes('"type":"chat_id"'))!
                 .replace(/^data:\s*/, ""),
         ) as { chatId: string; assistantMessageId: string };
-        const assistantInsert = findAssistantReservation();
-        const assistantUpdate = findAssistantUpdate();
-        expect(reservationExistedBeforeStreaming).toBe(true);
+    const userInsert = dbInserts.find(
+      ({ table, value }) =>
+        table === "chat_messages" &&
+        (value as { role?: unknown }).role === "user",
+    );
+    const inputMessageId = (userInsert?.value as { id?: string } | undefined)
+      ?.id;
+    const assistantInsert = findAssistantReservation();
+    const assistantUpdate = findAssistantUpdate();
+    expect(reservationExistedBeforeStreaming).toBe(true);
         expect(metadata.assistantMessageId).toMatch(
             /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
         );
+    expect(inputMessageId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    );
         expect(assistantInsert?.value).toMatchObject({
             id: metadata.assistantMessageId,
             chat_id: metadata.chatId,
             role: "assistant",
             content: null,
             citations: null,
+      author_user_id: "u1",
+      memory_input_message_id: inputMessageId,
         });
         expect(assistantUpdate?.value).toMatchObject({
             content: [{ type: "content", text: "hi there" }],
@@ -365,6 +438,65 @@ describe("POST /chat — streaming endpoint", () => {
                 { column: "chat_id", value: metadata.chatId },
             ]),
         );
+    expect(beginMemoryConversationTurn).toHaveBeenCalledWith({
+      db: expect.anything(),
+      surface: "chat",
+      conversationId: metadata.chatId,
+      actorUserId: "u1",
+    });
+    expect(
+      beginMemoryConversationTurn.mock.invocationCallOrder[0],
+    ).toBeLessThan(
+      vi.mocked(chatLib.buildDocContext).mock.invocationCallOrder[0],
+    );
+    expect(
+      beginMemoryConversationTurn.mock.invocationCallOrder[0],
+    ).toBeLessThan(runLLMStream.mock.invocationCallOrder[0]);
+    expect(scheduleMemoryConsolidation).toHaveBeenCalledWith({
+      db: expect.anything(),
+      surface: "chat",
+      conversationId: metadata.chatId,
+      actorUserId: "u1",
+      projectId: null,
+      turnId: metadata.assistantMessageId,
+      turn: { activityId: "activity-1" },
+    });
+    expect(scheduleMemoryConsolidation).toHaveBeenCalledTimes(1);
+    expect(releaseMemoryConversationTurn).not.toHaveBeenCalled();
+  });
+
+  it("stops before streaming or scheduling when the user message is not durable", async () => {
+    dbControl.failUserMessageInsert = true;
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const res = await request(app)
+      .post("/chat")
+      .set("Authorization", "Bearer test")
+      .send(VALID_BODY);
+
+    expect(res.status).toBe(500);
+    expect(runLLMStream).not.toHaveBeenCalled();
+    expect(beginMemoryConversationTurn).not.toHaveBeenCalled();
+    expect(scheduleMemoryConsolidation).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+
+  it("fails closed before streaming when memory activity cannot be fenced", async () => {
+    beginMemoryConversationTurn.mockRejectedValueOnce(
+      new Error("Memory activity could not be fenced"),
+    );
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const res = await request(app)
+      .post("/chat")
+      .set("Authorization", "Bearer test")
+      .send(VALID_BODY);
+
+    expect(res.status).toBe(500);
+    expect(res.body.detail).toBe("Something went wrong. Please try again.");
+    expect(runLLMStream).not.toHaveBeenCalled();
+    expect(scheduleMemoryConsolidation).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
     });
 
     it("rejects a chat without an explicit model before streaming", async () => {
@@ -404,9 +536,7 @@ describe("POST /chat — streaming endpoint", () => {
             table: "chats",
             value: expect.objectContaining({ model: "gpt-5.6-luna" }),
         });
-        expect(
-            userSettings.persistLastSelectedChatModel,
-        ).not.toHaveBeenCalled();
+    expect(userSettings.persistLastSelectedChatModel).not.toHaveBeenCalled();
     });
 
     it("surfaces an empty upstream completion as a visible retry error", async () => {
@@ -429,6 +559,45 @@ describe("POST /chat — streaming endpoint", () => {
         expect(res.text).toContain("empty response");
         expect(res.text).toContain('"safe_to_display":true');
         expect(res.text).toContain("[DONE]");
+    });
+
+    it("persists an ask-input pause without reporting an empty response", async () => {
+        const askInputsEvent = {
+            type: "ask_inputs" as const,
+            items: [
+                {
+                    id: "choice-1",
+                    kind: "choice" as const,
+                    question: "Continue?",
+                    options: [{ value: "Yes" }],
+                    allow_other: false,
+                    other_label: "Other",
+                },
+            ],
+    };
+    runLLMStream.mockImplementationOnce(
+      async (params: { write: (chunk: string) => void }) => {
+        params.write(`data: ${JSON.stringify(askInputsEvent)}\n\n`);
+        return {
+          fullText: "",
+          events: [askInputsEvent],
+                    citations: [],
+                };
+            },
+        );
+
+        const res = await request(app)
+            .post("/chat")
+            .set("Authorization", "Bearer test")
+            .send(VALID_BODY);
+
+        expect(res.status).toBe(200);
+        expect(res.text).toContain('"type":"ask_inputs"');
+        expect(res.text).not.toContain("empty response");
+        expect(findAssistantUpdate()?.value).toMatchObject({
+            content: [askInputsEvent],
+        });
+        expect(scheduleMemoryConsolidation).not.toHaveBeenCalled();
     });
 
     it("stores cloud Word chats only in the document-scoped Word tables", async () => {
@@ -612,9 +781,9 @@ describe("POST /chat — streaming endpoint", () => {
         expect(res.status).toBe(404);
         expect(res.body.detail).toBe("Chat not found");
         expect(runLLMStream).not.toHaveBeenCalled();
-        expect(
-            dbInserts.some(({ table }) => table === "word_chat_messages"),
-        ).toBe(false);
+    expect(dbInserts.some(({ table }) => table === "word_chat_messages")).toBe(
+      false,
+    );
     });
 
     it("streams local Word chats without inserting any chat rows", async () => {
@@ -646,6 +815,7 @@ describe("POST /chat — streaming endpoint", () => {
         expect(auditJob.payload.base.title).not.toContain("hello");
         expect(dbUpdates).toEqual([]);
         expect(runLLMStream).toHaveBeenCalledTimes(1);
+    expect(scheduleMemoryConsolidation).not.toHaveBeenCalled();
     });
 
     it("does not finish the SSE response until the terminal assistant update succeeds", async () => {
@@ -703,9 +873,7 @@ describe("POST /chat — streaming endpoint", () => {
 
     it("reports a terminal persistence failure before ending the SSE stream", async () => {
         dbControl.terminalUpdateFailures = 3;
-        const errorSpy = vi
-            .spyOn(console, "error")
-            .mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
         const res = await request(app)
             .post("/chat")
@@ -730,14 +898,13 @@ describe("POST /chat — streaming endpoint", () => {
                 message: "terminal update failed (attempt 3)",
             }),
         );
+    expect(scheduleMemoryConsolidation).not.toHaveBeenCalled();
         errorSpy.mockRestore();
     });
 
     it("fails before advertising SSE metadata when the assistant row cannot be reserved", async () => {
         dbControl.failAssistantReservation = true;
-        const errorSpy = vi
-            .spyOn(console, "error")
-            .mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
         const res = await request(app)
             .post("/chat")
@@ -751,6 +918,13 @@ describe("POST /chat — streaming endpoint", () => {
         expect(findAssistantReservation()).toBeDefined();
         expect(runLLMStream).not.toHaveBeenCalled();
         expect(findAssistantUpdate()).toBeUndefined();
+    expect(releaseMemoryConversationTurn).toHaveBeenCalledWith({
+      db: expect.anything(),
+      surface: "chat",
+      conversationId: expect.any(String),
+      turn: { activityId: "activity-1" },
+    });
+    expect(scheduleMemoryConsolidation).not.toHaveBeenCalled();
         expect(errorSpy).toHaveBeenCalledWith(
             "[chat/stream] failed to reserve assistant message",
             expect.objectContaining({
@@ -794,11 +968,17 @@ describe("POST /chat — streaming endpoint", () => {
             content: [
                 expect.objectContaining({
                     type: "error",
-                    message:
-                        "The response could not be completed. Please try again.",
+          message: "The response could not be completed. Please try again.",
                 }),
             ],
         });
+    expect(releaseMemoryConversationTurn).toHaveBeenCalledWith({
+      db: expect.anything(),
+      surface: "chat",
+      conversationId: metadata.chatId,
+      turn: { activityId: "activity-1" },
+    });
+    expect(scheduleMemoryConsolidation).not.toHaveBeenCalled();
     });
 
     it("uses the streamed assistant message id when persisting a cancelled partial response", async () => {
@@ -837,19 +1017,54 @@ describe("POST /chat — streaming endpoint", () => {
                 { type: "content", text: "Cancelled by user." },
             ]),
         });
+    expect(releaseMemoryConversationTurn).toHaveBeenCalledWith({
+      db: expect.anything(),
+      surface: "chat",
+      conversationId: metadata.chatId,
+      turn: { activityId: "activity-1" },
+    });
+    expect(scheduleMemoryConsolidation).not.toHaveBeenCalled();
     });
 
     it("does not allocate or insert a new assistant message for an ask-input continuation", async () => {
+    dbControl.assistantMessageRows = [
+      {
+        id: "assistant-existing",
+        chat_id: "chat-1",
+        role: "assistant",
+        content: [
+          {
+            type: "ask_inputs",
+            event_id: "ask-1",
+            items: [
+              {
+                id: "choice-1",
+                kind: "choice",
+                question: "Continue?",
+                options: [{ value: "Yes" }, { value: "No" }],
+                allow_other: false,
+                other_label: "Other",
+              },
+            ],
+          },
+        ],
+        citations: null,
+        author_user_id: "u1",
+        created_at: "2026-01-01T00:00:00Z",
+      },
+    ];
         const res = await request(app)
             .post("/chat")
             .set("Authorization", "Bearer test")
             .send({
-                ...VALID_BODY,
-                chat_id: "chat-1",
-                ask_inputs_response: {
-                    responses: [
-                        {
-                            id: "choice-1",
+        ...VALID_BODY,
+        chat_id: "chat-1",
+        ask_inputs_response: {
+          assistant_message_id: "assistant-existing",
+          ask_event_id: "ask-1",
+          responses: [
+            {
+              id: "choice-1",
                             kind: "choice",
                             question: "Continue?",
                             answer: "Yes",
@@ -882,12 +1097,28 @@ describe("POST /chat — streaming endpoint", () => {
         // the older, real message that actually asked the question.
         dbControl.assistantMessageRows = [
             {
-                id: "assistant-real",
-                chat_id: "chat-1",
-                role: "assistant",
-                content: [{ type: "ask_inputs", items: [] }],
-                citations: null,
-                created_at: "2026-01-01T00:00:00Z",
+        id: "assistant-real",
+        chat_id: "chat-1",
+        role: "assistant",
+        content: [
+          {
+            type: "ask_inputs",
+            event_id: "ask-1",
+            items: [
+              {
+                id: "choice-1",
+                kind: "choice",
+                question: "Continue?",
+                options: [{ value: "Yes" }, { value: "No" }],
+                allow_other: false,
+                other_label: "Other",
+              },
+            ],
+          },
+        ],
+        citations: null,
+        author_user_id: "u1",
+        created_at: "2026-01-01T00:00:00Z",
             },
             {
                 id: "assistant-reservation",
@@ -895,6 +1126,7 @@ describe("POST /chat — streaming endpoint", () => {
                 role: "assistant",
                 content: null,
                 citations: null,
+                author_user_id: "u1",
                 created_at: "2026-01-01T00:05:00Z",
             },
         ];
@@ -903,55 +1135,40 @@ describe("POST /chat — streaming endpoint", () => {
             .post("/chat")
             .set("Authorization", "Bearer test")
             .send({
-                ...VALID_BODY,
-                chat_id: "chat-1",
-                ask_inputs_response: {
-                    responses: [
-                        {
-                            id: "choice-1",
+        ...VALID_BODY,
+        chat_id: "chat-1",
+        ask_inputs_response: {
+          assistant_message_id: "assistant-real",
+          ask_event_id: "ask-1",
+          responses: [
+            {
+              id: "choice-1",
                             kind: "choice",
                             question: "Continue?",
                             answer: "Yes",
                         },
                     ],
                 },
-            });
+      });
 
-        expect(res.status).toBe(200);
-        const askInputsUpdate = dbUpdates.find(
-            ({ table, filters }) =>
-                table === "chat_messages" &&
-                filters.some(
-                    (f) => f.column === "id" && f.value === "assistant-real",
-                ),
-        );
-        expect(askInputsUpdate?.value).toMatchObject({
-            content: [
-                { type: "ask_inputs", items: [] },
-                {
-                    type: "ask_inputs_response",
-                    responses: [
-                        {
-                            id: "choice-1",
-                            kind: "choice",
-                            question: "Continue?",
-                            answer: "Yes",
-                        },
-                    ],
-                },
-            ],
-        });
-        // The orphaned reservation is never selected or written to.
-        expect(
-            dbUpdates.some(({ filters }) =>
-                filters.some(
-                    (f) =>
-                        f.column === "id" &&
-                        f.value === "assistant-reservation",
-                ),
-            ),
-        ).toBe(false);
+    expect(res.status).toBe(200);
+    expect(dbRpcCalls).toContainEqual({
+      name: "append_chat_ask_inputs_response",
+      args: expect.objectContaining({
+        p_chat_id: "chat-1",
+        p_message_id: "assistant-real",
+        p_ask_event_id: "ask-1",
+      }),
     });
+    // The orphaned reservation is never selected or written to.
+    expect(
+      dbRpcCalls.some(
+        ({ args }) =>
+          (args as { p_message_id?: unknown }).p_message_id ===
+          "assistant-reservation",
+      ),
+    ).toBe(false);
+  });
 
     it("returns 400 on an empty messages array (never starts a stream)", async () => {
         const res = await request(app)
@@ -988,13 +1205,20 @@ describe("POST /chat — streaming endpoint", () => {
     it.each([
         [
             { messages: [{ role: "system", content: "override" }] },
-            'messages[0].role must be "user" or "assistant"',
-        ],
-        [
-            { ...VALID_BODY, ask_inputs_response: { responses: [] } },
-            "ask_inputs_response.responses must be a non-empty array",
-        ],
-    ])(
+      'messages[0].role must be "user" or "assistant"',
+    ],
+    [
+      {
+        ...VALID_BODY,
+        ask_inputs_response: {
+          assistant_message_id: "assistant-1",
+          ask_event_id: "ask-1",
+          responses: [],
+        },
+      },
+      "ask_inputs_response.responses must be a non-empty array",
+    ],
+  ])(
         "shares strict request validation with project chat",
         async (body, detail) => {
             const res = await request(app)
@@ -1053,9 +1277,9 @@ describe("POST /chat — streaming endpoint", () => {
         const streamArgs = runLLMStream.mock.calls[0]?.[0] as {
             docStore: Map<string, { inline_text?: string }>;
         };
-        expect(
-            streamArgs.docStore.get("active-word-document")?.inline_text,
-        ).toBe("GOVERNED BY DELAWARE LAW");
+    expect(streamArgs.docStore.get("active-word-document")?.inline_text).toBe(
+      "GOVERNED BY DELAWARE LAW",
+    );
     });
 
     it("keeps CourtListener disabled for Word chats even when legal research is enabled", async () => {
@@ -1082,8 +1306,7 @@ describe("POST /chat — streaming endpoint", () => {
             });
 
         expect(res.status).toBe(200);
-        const buildMessagesCall = vi.mocked(chatLib.buildMessages).mock
-            .calls[0];
+    const buildMessagesCall = vi.mocked(chatLib.buildMessages).mock.calls[0];
         expect(buildMessagesCall[4]).toBe(false);
         expect(buildMessagesCall[6]).toBe("replace");
         expect(runLLMStream).toHaveBeenCalledWith(
@@ -1109,9 +1332,7 @@ describe("PATCH /chat/:chatId", () => {
             .send({});
 
         expect(res.status).toBe(400);
-        expect(res.body.detail).toBe(
-            "title, model or reasoningLevel is required",
-        );
+    expect(res.body.detail).toBe("title, model or reasoningLevel is required");
     });
 
     it("updates the chat and profile when a model is selected", async () => {
@@ -1147,9 +1368,11 @@ describe("PATCH /chat/:chatId", () => {
             value: { reasoning_level: "xhigh" },
             filters: [{ column: "id", value: "chat-1" }],
         });
-        expect(
-            userSettings.persistLastSelectedReasoningLevel,
-        ).toHaveBeenCalledWith("u1", "xhigh", expect.anything());
+    expect(userSettings.persistLastSelectedReasoningLevel).toHaveBeenCalledWith(
+      "u1",
+      "xhigh",
+      expect.anything(),
+    );
     });
 });
 
@@ -1257,9 +1480,22 @@ function tableQuery(
     const rows = Array.isArray(seed) ? seed : seed ? [seed] : [];
     const q: Record<string, unknown> = {};
     const chain = [
-        "select", "insert", "upsert",
-        "neq", "is", "not", "or", "lt", "gt", "gte", "lte",
-        "filter", "order", "limit", "range", "contains",
+    "select",
+    "insert",
+    "upsert",
+    "neq",
+    "is",
+    "not",
+    "or",
+    "lt",
+    "gt",
+    "gte",
+    "lte",
+    "filter",
+    "order",
+    "limit",
+    "range",
+    "contains",
     ];
     for (const m of chain) q[m] = vi.fn(() => q);
     // A write in flight collects its own filters; before that, eq/in narrow
@@ -1286,8 +1522,7 @@ function tableQuery(
     });
     q.eq = vi.fn((column: string, value: unknown) => {
         if (write) write.filters.push({ column, value });
-        else
-            selectFilters.push({ column, match: (actual) => actual === value });
+    else selectFilters.push({ column, match: (actual) => actual === value });
         return q;
     });
     q.in = vi.fn((column: string, values: unknown[]) => {
@@ -1431,7 +1666,6 @@ async function seedResolvableModel() {
 describe("chat writes are gated on content.edit (org RBAC)", () => {
     const mockedCreate = vi.mocked(createServerSupabase);
 
-
     beforeEach(() => {
         vi.clearAllMocks();
         runLLMStream.mockResolvedValue({
@@ -1448,7 +1682,8 @@ describe("chat writes are gated on content.edit (org RBAC)", () => {
 
     it("403s a personal-project Viewer POSTing to an existing chat", async () => {
         mockedCreate.mockImplementation(
-            () => makeRbacDb(null, "colleague-1", {
+      () =>
+        makeRbacDb(null, "colleague-1", {
                 grantRole: "viewer",
                 project: { org_id: null },
                 chat: { org_id: null },
@@ -1467,7 +1702,8 @@ describe("chat writes are gated on content.edit (org RBAC)", () => {
 
     it("403s a personal-project Viewer calling generate-title", async () => {
         mockedCreate.mockImplementation(
-            () => makeRbacDb(null, "colleague-1", {
+      () =>
+        makeRbacDb(null, "colleague-1", {
                 grantRole: "viewer",
                 project: { org_id: null },
                 chat: { org_id: null },
@@ -1643,9 +1879,7 @@ describe("chat grants, deletion and roster", () => {
         expect(res.status).toBe(500);
         expect(res.body.detail).not.toBe("Chat not found");
         // Never the raw driver message — sendInternalError redacts.
-        expect(JSON.stringify(res.body)).not.toContain(
-            "connection terminated",
-        );
+    expect(JSON.stringify(res.body)).not.toContain("connection terminated");
     });
 
     it("403s a project viewer renaming a colleague's chat", async () => {
@@ -1790,9 +2024,7 @@ describe("chat grants, deletion and roster", () => {
             .send({ email: "ghost@example.com", role: "manager" });
 
         expect(res.status).toBe(400);
-        expect(res.body.detail).toBe(
-            "role must be owner, editor or viewer",
-        );
+    expect(res.body.detail).toBe("role must be owner, editor or viewer");
     });
 
     it("lets the chat's creator delete their chat (204)", async () => {
@@ -2044,6 +2276,20 @@ describe("chat grants, deletion and roster", () => {
 
             expect(res.status).toBe(200);
             expect(res.body.title).toBe("Generated Title");
+        });
+
+        it("marks a collaborator's generated turn as shared memory context", async () => {
+            mockedCreate.mockImplementation(directShare);
+
+            const res = await request(app)
+                .post("/chat")
+                .set("Authorization", "Bearer test")
+                .send({ ...VALID_BODY, chat_id: "chat-1" });
+
+            expect(res.status).toBe(200);
+            expect(runLLMStream).toHaveBeenCalledWith(
+                expect.objectContaining({ memorySharedAudience: true }),
+            );
         });
 
         it("may not delete the chat (container.delete)", async () => {

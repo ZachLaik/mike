@@ -2,6 +2,12 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { ChevronDown, Download, Loader2 } from "lucide-react";
+import {
+    EventDisclosureButton,
+    EventLabel,
+} from "@/app/components/assistant/message/EventDisclosure";
+import { WorkflowSkeuoIcon } from "@/app/components/shared/AppSidebarSkeuoIcons";
+import { VersionChip } from "@/app/components/shared/VersionChip";
 import { API_BASE } from "@/app/lib/mikeApi";
 import { authenticatedFetch } from "@/app/lib/authEvents";
 import type { AssistantEvent } from "../../shared/types";
@@ -115,26 +121,18 @@ export function ReasoningBlock({
             isStreaming={isStreaming}
             dotColor="gray"
         >
-            <button
-                type="button"
-                aria-expanded={showContent}
-                onClick={() => {
+            <EventDisclosureButton
+                open={showContent}
+                onToggle={() => {
                     setUserToggledContent(true);
                     setIsContentOpen((v) => !v);
                 }}
-                className="flex items-center text-sm font-serif text-gray-500 hover:text-gray-600 transition-colors"
-            >
-                <span className="font-medium">
-                    {isStreaming
+                label={
+                    isStreaming
                         ? THINKING_PHRASES[thinkingIndex]
-                        : "Thought process"}
-                </span>
-                <ChevronDown
-                    size={10}
-                    aria-hidden="true"
-                    className={`relative top-px ml-1 transition-transform duration-200 ${isContentOpen ? "" : "-rotate-90"}`}
-                />
-            </button>
+                        : "Thought process"
+                }
+            />
             {showContent && (
                 <div className="mt-2">
                     <div
@@ -268,9 +266,9 @@ export function DocCreatedBlock({
             dotColor="green"
         >
             <div className="flex min-w-0 items-center gap-1.5">
-                <span className="shrink-0 font-medium">
+                <EventLabel className="shrink-0">
                     {isStreaming ? "Creating" : "Created"}
-                </span>
+                </EventLabel>
                 {isStreaming || !onClick ? (
                     <span className="flex min-w-0 items-center gap-1.5">
                         <FileTypeIcon
@@ -341,32 +339,45 @@ export function DocReplicatedBlock({
             isStreaming={isStreaming}
             dotColor={hasError ? "red" : "green"}
         >
-            <span className="font-medium">{label}</span>{" "}
-            {!isStreaming && copies?.length ? (
-                <span>
-                    {copies.map((copy, index) => (
-                        <span key={copy.document_id}>
-                            {index > 0 && ", "}
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                <EventLabel className="shrink-0">{label}</EventLabel>
+                {!isStreaming && copies?.length ? (
+                    copies.map((copy, index) => (
+                        <span
+                            key={copy.document_id}
+                            className="flex min-w-0 items-center gap-1.5"
+                        >
+                            {index > 0 && <span aria-hidden="true">,</span>}
+                            <FileTypeIcon
+                                fileType={copy.new_filename}
+                                className="h-3.5 w-3.5 shrink-0"
+                            />
                             {onOpenCopy ? (
                                 <button
                                     type="button"
                                     onClick={() => onOpenCopy(copy)}
-                                    className="cursor-pointer text-left transition-colors hover:text-gray-700"
+                                    className="min-w-0 cursor-pointer truncate text-left transition-colors hover:text-gray-700"
                                 >
                                     {copy.new_filename}
                                 </button>
                             ) : (
-                                copy.new_filename
+                                <span className="truncate">
+                                    {copy.new_filename}
+                                </span>
                             )}
                         </span>
-                    ))}
-                </span>
-            ) : (
-                <>
-                    <span>{filename}</span>
-                    <span>{suffix}</span>
-                </>
-            )}
+                    ))
+                ) : (
+                    <span className="flex min-w-0 items-center gap-1.5">
+                        <FileTypeIcon
+                            fileType={filename}
+                            className="h-3.5 w-3.5 shrink-0"
+                        />
+                        <span className="truncate">{filename}</span>
+                        {suffix ? <span className="shrink-0">{suffix}</span> : null}
+                    </span>
+                )}
+            </div>
         </EventBlock>
     );
 }
@@ -384,10 +395,6 @@ export function DocDownloadBlock({
     isReloading?: boolean;
     versionNumber?: number | null;
 }) {
-    const hasVersion =
-        typeof versionNumber === "number" &&
-        Number.isFinite(versionNumber) &&
-        versionNumber > 0;
     const extMatch = filename.match(/\.(\w+)$/);
     const rawBasename = extMatch
         ? filename.slice(0, -extMatch[0].length)
@@ -437,11 +444,7 @@ export function DocDownloadBlock({
                     <p className="text-lg font-serif text-gray-900 text-wrap">
                         {basename}
                     </p>
-                    {hasVersion && (
-                        <span className="shrink-0 inline-flex items-center rounded-md border border-gray-200 bg-white px-1.5 py-0.5 text-[10px] font-medium text-gray-500">
-                            V{versionNumber}
-                        </span>
-                    )}
+                    <VersionChip n={versionNumber} size="lg" />
                 </div>
             </div>
         </div>
@@ -519,17 +522,25 @@ export function WorkflowAppliedBlock({
 }) {
     return (
         <EventBlock showConnector={showConnector} dotColor="green">
-            <span className="font-medium">Read Workflow</span>{" "}
-            {onClick ? (
-                <button
-                    onClick={onClick}
-                    className="text-left hover:text-gray-700 transition-colors cursor-pointer"
-                >
-                    {title}
-                </button>
-            ) : (
-                <span>{title}</span>
-            )}
+            <div className="flex min-w-0 items-center gap-1.5">
+                <EventLabel className="shrink-0">Read</EventLabel>
+                {onClick ? (
+                    <button
+                        type="button"
+                        onClick={onClick}
+                        aria-label={`Open workflow ${title}`}
+                        className="flex min-w-0 cursor-pointer items-center gap-1.5 text-left transition-colors hover:text-gray-700"
+                    >
+                        <WorkflowSkeuoIcon className="h-3.5 w-3.5 shrink-0" />
+                        <span className="truncate">{title}</span>
+                    </button>
+                ) : (
+                    <span className="flex min-w-0 items-center gap-1.5">
+                        <WorkflowSkeuoIcon className="h-3.5 w-3.5 shrink-0" />
+                        <span className="truncate">{title}</span>
+                    </span>
+                )}
+            </div>
         </EventBlock>
     );
 }
@@ -552,17 +563,11 @@ export function AskInputsBlock({
             showConnector={showConnector}
             dotColor={response ? "green" : "gray"}
         >
-            <button
-                type="button"
-                aria-expanded={isOpen}
-                onClick={() => setIsOpen((open) => !open)}
-                className="flex items-center gap-1 font-medium text-gray-600 transition-colors hover:text-gray-800"
-            >
-                {response ? "Asked for input" : "Asking for input"}
-                <ChevronDown
-                    className={`h-3.5 w-3.5 transition-transform ${isOpen ? "rotate-180" : ""}`}
-                />
-            </button>
+            <EventDisclosureButton
+                open={isOpen}
+                onToggle={() => setIsOpen((open) => !open)}
+                label={response ? "Asked for input" : "Asking for input"}
+            />
             {isOpen && (
                 <div className="mt-2 space-y-2 text-gray-800">
                     {event.items.map((item, index) => {
@@ -570,6 +575,9 @@ export function AskInputsBlock({
                         const responseText = (() => {
                             if (!itemResponse) return null;
                             if (itemResponse.skipped) return "Skipped";
+                            if (itemResponse.kind === "multi_choice") {
+                                return itemResponse.answers?.join(", ") ?? "";
+                            }
                             if (itemResponse.kind !== "documents") {
                                 return itemResponse.answer ?? "";
                             }
@@ -640,22 +648,17 @@ export function CourtListenerBlock({
             dotColor={hasError ? "red" : "green"}
         >
             {hasItems ? (
-                <button
-                    onClick={() => setIsOpen((v) => !v)}
-                    className="text-left hover:text-gray-700 transition-colors inline-flex items-center"
-                >
-                    <span className="font-medium">{label}</span>
-                    {detail ? <span>&nbsp;{detail}</span> : null}
-                    {isStreaming ? <span>...</span> : null}
-                    <ChevronDown
-                        size={10}
-                        className={`relative top-px ml-1 transition-transform duration-200 ${isOpen ? "" : "-rotate-90"}`}
-                    />
-                </button>
+                <EventDisclosureButton
+                    open={isOpen}
+                    onToggle={() => setIsOpen((v) => !v)}
+                    label={label}
+                    detail={detail}
+                    isStreaming={isStreaming}
+                />
             ) : (
                 <>
-                    <span className="font-medium">{label}</span>
-                    {detail ? <span> {detail}</span> : null}
+                    <EventLabel>{label}</EventLabel>
+                    {detail ? <span>&nbsp;{detail}</span> : null}
                     {isStreaming ? <span>...</span> : null}
                 </>
             )}

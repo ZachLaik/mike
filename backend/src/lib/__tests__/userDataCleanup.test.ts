@@ -36,7 +36,122 @@ function makeDb(
     for (const [name, rows] of Object.entries(initialTables)) {
         tables[name] = rows.map((row) => ({ ...row }));
     }
+
+    const removeRows = (
+        table: string,
+        predicate: (row: Row) => boolean,
+    ): Row[] => {
+        const rows = tables[table] ?? [];
+        const removed = rows.filter(predicate);
+        tables[table] = rows.filter((row) => !predicate(row));
+        return removed;
+    };
+
+    // The production schema uses FK cascades for project/review/chat trees.
+    // Model those cascades here so a parent-only DELETE exercises the same
+    // behavior without reintroducing unsafe pre-delete child enumeration.
+    const cascadeDelete = (table: string, removed: Row[]) => {
+        const removedIds = removed
+            .map((row) => row.id)
+            .filter((id): id is string => typeof id === "string");
+        if (removedIds.length === 0) return;
+
+        if (table === "projects") {
+            cascadeDelete(
+                "documents",
+                removeRows("documents", (row) =>
+                    removedIds.includes(String(row.project_id)),
+                ),
+            );
+            cascadeDelete(
+                "chats",
+                removeRows("chats", (row) =>
+                    removedIds.includes(String(row.project_id)),
+                ),
+            );
+            cascadeDelete(
+                "tabular_reviews",
+                removeRows("tabular_reviews", (row) =>
+                    removedIds.includes(String(row.project_id)),
+                ),
+            );
+            removeRows("project_subfolders", (row) =>
+                removedIds.includes(String(row.project_id)),
+            );
+            cascadeDelete(
+                "memory_files",
+                removeRows("memory_files", (row) =>
+                    removedIds.includes(String(row.project_id)),
+                ),
+            );
+        } else if (table === "documents") {
+            removeRows("document_versions", (row) =>
+                removedIds.includes(String(row.document_id)),
+            );
+        } else if (table === "chats") {
+            removeRows("chat_messages", (row) =>
+                removedIds.includes(String(row.chat_id)),
+            );
+        } else if (table === "tabular_reviews") {
+            cascadeDelete(
+                "tabular_review_chats",
+                removeRows("tabular_review_chats", (row) =>
+                    removedIds.includes(String(row.review_id)),
+                ),
+            );
+            removeRows("tabular_cells", (row) =>
+                removedIds.includes(String(row.review_id)),
+            );
+            removeRows("tabular_review_rows", (row) =>
+                removedIds.includes(String(row.review_id)),
+            );
+        } else if (table === "tabular_review_chats") {
+            removeRows("tabular_review_chat_messages", (row) =>
+                removedIds.includes(String(row.chat_id)),
+            );
+        } else if (table === "word_documents") {
+            cascadeDelete(
+                "word_chats",
+                removeRows("word_chats", (row) =>
+                    removedIds.includes(String(row.document_id)),
+                ),
+            );
+        } else if (table === "word_chats") {
+            removeRows("word_chat_messages", (row) =>
+                removedIds.includes(String(row.chat_id)),
+            );
+        }
+    };
     const db = {
+        async rpc(name: string, args: Record<string, unknown>) {
+            if (name !== "wipe_memory_file") {
+                return { data: null, error: { message: `unknown rpc: ${name}` } };
+            }
+            const file = (tables.memory_files ?? []).find(
+                (row) => row.id === args.p_memory_file_id,
+            );
+            if (!file) {
+                return { data: null, error: { message: "memory_file_not_found" } };
+            }
+            Object.assign(file, {
+                enabled: args.p_enabled,
+                epoch: Number(file.epoch ?? 0) + 1,
+                version: Number(file.version ?? 0) + 1,
+                content: "",
+                content_sha256: null,
+                size_bytes: 0,
+            });
+            return {
+                data: [
+                    {
+                        new_epoch: Number(file.epoch),
+                        new_revision: Number(file.version),
+                        effective_enabled: file.enabled,
+                    },
+                ],
+                error: null,
+            };
+        },
         from(table: string) {
             const rowsOf = () => tables[table] ?? (tables[table] = []);
             let predicate: (row: Row) => boolean = () => true;
@@ -104,6 +219,7 @@ function makeDb(
                             tables[table] = rowsOf().filter(
                                 (row) => !predicate(row),
                             );
+                            cascadeDelete(table, removed);
                             // Supabase returns the deleted rows when the call
                             // chains .select(); the grant cleanup uses that to
                             // learn which projects need their mirror rebuilt.
@@ -201,7 +317,7 @@ describe("deleteAllUserTabularReviews", () => {
             ],
         });
 
-    it("cascades messages, chats, and cells before the reviews", async () => {
+    it("atomically cascades messages, chats, and cells with the reviews", async () => {
         const { db, tables } = fixture();
         await expect(deleteAllUserTabularReviews(db, "u1")).resolves.toBe(2);
         expect(ids(tables.tabular_reviews)).toEqual(["r-other"]);
@@ -277,6 +393,26 @@ describe("deleteUserProjects", () => {
                 { id: "f1", project_id: "p1" },
                 { id: "f-other", project_id: "p-other" },
             ],
+            memory_files: [
+                {
+                    id: "memory-p1",
+                    scope: "project",
+                    project_id: "p1",
+                    enabled: true,
+                },
+                {
+                    id: "memory-p2",
+                    scope: "project",
+                    project_id: "p2",
+                    enabled: true,
+                },
+                {
+                    id: "memory-other",
+                    scope: "project",
+                    project_id: "p-other",
+                    enabled: true,
+                },
+            ],
         }, options);
 
     it("cascades project contents and storage files for owned projects", async () => {
@@ -292,6 +428,16 @@ describe("deleteUserProjects", () => {
         expect(ids(tables.tabular_review_chat_messages)).toEqual(["rm-other"]);
         expect(ids(tables.tabular_cells)).toEqual(["cell-other"]);
         expect(ids(tables.project_subfolders)).toEqual(["f-other"]);
+        // Deleted projects' memory is emptied under its row lock before the
+        // rows cascade; a colleague's surviving project keeps its own.
+        expect(
+            (tables.memory_files ?? []).map((row) => [row.id, row.content]),
+        ).toEqual([["memory-other", undefined]]);
+        expect(
+            (tables.db_jobs ?? []).filter(
+                (job) => job.kind === "storage.cleanup",
+            ),
+        ).toEqual([]);
 
         const deletedPaths = deleteFileMock.mock.calls.map(([path]) => path);
         expect(deletedPaths.sort()).toEqual([
@@ -331,7 +477,7 @@ describe("deleteUserProjects", () => {
         // failed cascade leaves rows AND bytes for the retry instead of
         // surviving documents whose versions all 404.
         const { db } = fixture({
-            deleteErrors: { documents: "connection reset" },
+            deleteErrors: { projects: "connection reset" },
         });
 
         await expect(deleteUserProjects(db, "u1")).rejects.toThrow();
@@ -458,6 +604,26 @@ describe("deleteUserAccountData", () => {
                 { id: "a2", user_id: "u1" },
                 { id: "a-other", user_id: "u2" },
             ],
+            memory_files: [
+                {
+                    id: "memory-u1",
+                    scope: "user",
+                    user_id: "u1",
+                    enabled: true,
+                },
+                {
+                    id: "memory-p1",
+                    scope: "project",
+                    project_id: "p1",
+                    enabled: true,
+                },
+                {
+                    id: "memory-p-other",
+                    scope: "project",
+                    project_id: "p-other",
+                    enabled: true,
+                },
+            ],
         }, options);
 
     it("removes the user's rows, files, and share references everywhere", async () => {
@@ -486,6 +652,23 @@ describe("deleteUserAccountData", () => {
         // Audit rows carry PII (email, titles, prompt excerpts) and must be
         // purged on account deletion — only the other user's row survives.
         expect(ids(tables.audit_events)).toEqual(["a-other"]);
+
+        // Private app memory and personal-project memory are emptied under
+        // their row locks before their owner rows cascade. A colleague's
+        // surviving project memory is not this account's data.
+        expect(
+            (tables.memory_files ?? []).map((row) => ({
+                id: row.id,
+                enabled: row.enabled,
+                content: row.content,
+            })),
+        ).toEqual([
+            // The app file is emptied and fenced here; its row goes with the
+            // auth.users cascade.
+            { id: "memory-u1", enabled: false, content: "" },
+            // A colleague's project keeps its own shared memory.
+            { id: "memory-p-other", enabled: true, content: undefined },
+        ]);
 
         // Shares by the user and shares to the user's email are both removed.
         expect(ids(tables.workflow_shares)).toEqual(["ws-keep"]);

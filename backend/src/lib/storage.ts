@@ -92,6 +92,14 @@ function requireStorageConfig(): void {
   }
 }
 
+/**
+ * Fail closed for workflows where treating an unconfigured object store as an
+ * empty/successful operation would discard the only durable deletion pointer.
+ */
+export function assertStorageConfigured(): void {
+  requireStorageConfig();
+}
+
 // ---------------------------------------------------------------------------
 // Upload
 // ---------------------------------------------------------------------------

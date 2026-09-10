@@ -141,6 +141,9 @@ services:
       - ./backend/migrations/20260901_03_workflow_assets_as_documents.sql:/workflow-assets-migration.sql:ro
       - ./backend/migrations/20260904_01_organization_access.sql:/organization-access-migration.sql:ro
       - ./backend/migrations/20260904_02_migrate_legacy_sharing.sql:/legacy-sharing-migration.sql:ro
+      - ./backend/migrations/20260905_01_scoped_memory_files.sql:/scoped-memory-migration.sql:ro
+      - ./backend/migrations/20260908_01_remove_transparent_tables.sql:/remove-transparent-tables-migration.sql:ro
+      - ./backend/migrations/20260909_01_memory_safety_boundaries.sql:/memory-safety-migration.sql:ro
     entrypoint: ["bash", "-c"]
     command:
       - |
@@ -169,6 +172,11 @@ services:
         psql "$$DB" -v ON_ERROR_STOP=1 -f /workflow-assets-migration.sql;
         psql "$$DB" -v ON_ERROR_STOP=1 -f /organization-access-migration.sql;
         psql "$$DB" -v ON_ERROR_STOP=1 -f /legacy-sharing-migration.sql;
+        if ! psql "$$DB" -tAc "select to_regclass('public.memory_files')" | grep -q memory_files; then
+          psql "$$DB" -v ON_ERROR_STOP=1 -f /scoped-memory-migration.sql;
+        fi
+        psql "$$DB" -v ON_ERROR_STOP=1 -f /remove-transparent-tables-migration.sql;
+        psql "$$DB" -v ON_ERROR_STOP=1 -f /memory-safety-migration.sql;
         psql "$$DB" -c "grant usage on schema public to service_role;
           grant all privileges on all tables in schema public to service_role;
           grant all privileges on all sequences in schema public to service_role;
